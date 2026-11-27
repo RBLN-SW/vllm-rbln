@@ -14,20 +14,20 @@
 """E2E check that encoder models end up with the right sequence pooling.
 
 For each real encoder architecture supported by the RBLN optimum path a real
-``VllmConfig`` is built, so vLLM's own ``ModelConfig`` resolves ``pooler_config``
-exactly as it would in production. The model is then built through the real
-``RBLNOptimumForEncoderModel.__init__`` code path; only the optimum-rbln model
-compilation/loading (``init_model``) is faked, since that requires an NPU.
+`VllmConfig` is built, so vLLM's own `ModelConfig` resolves `pooler_config`
+exactly as it would in production. The model is built through `load_model`;
+only the optimum-rbln model compilation/loading (`init_model`) is faked,
+since that requires an NPU.
 
-Encoder-only models (BertModel / RobertaModel / XLMRobertaModel and their
-``*ForSequenceClassification`` variants) are forced to CLS pooling. Decoder-based
-pooling models (Qwen3 embedding) keep their native LAST-token pooling — CLS
-(token 0) would be wrong for a causal model.
+Every model keeps the pooling vLLM resolved for it: the sentence-transformers
+config the repository ships where there is one (MEAN for E5 and MiniLM, CLS for
+BGE), and the upstream class default otherwise. Decoder-based pooling models
+(Qwen3 embedding) come out as LAST.
 
 We assert that:
   * the pooling type comes out as expected per architecture, and
-  * the right pooler is selected per task — ``DispatchPooler`` (embed) for the
-    plain encoders and ``RBLNClassifierPooler`` for the classification ones.
+  * the right pooler is selected per task — `DispatchPooler` (embed) for the
+    plain encoders and `RBLNClassifierPooler` for the classification ones.
 """
 
 from types import SimpleNamespace
@@ -38,6 +38,7 @@ import torch
 from vllm.config import (
     CacheConfig,
     ModelConfig,
+    PoolerConfig,
     SchedulerConfig,
     VllmConfig,
     set_current_vllm_config,
@@ -45,6 +46,7 @@ from vllm.config import (
 from vllm.model_executor.layers.pooler import DispatchPooler
 from vllm.model_executor.layers.pooler.seqwise import SequencePooler
 
+from vllm_rbln.model_executor.models.optimum import load_model
 from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.encoder import (
     RBLNClassifierPooler,
@@ -55,14 +57,20 @@ from vllm_rbln.model_executor.models.optimum.qwen3_vl import RBLNOptimumQwen3VLM
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding
 
 # (model id, expected seq_pooling_type, expected pooler) per architecture.
-# Encoder-only models are forced to CLS; the *ForSequenceClassification ones use
-# the passthrough classifier pooler. Qwen3 embedding is decoder-based and keeps
-# its native LAST-token pooling.
+# The *ForSequenceClassification ones use the passthrough classifier pooler.
 ENCODER_MODELS = [
-    # arch: BertModel
-    ("sentence-transformers/all-MiniLM-L6-v2", "CLS", DispatchPooler),
-    # arch: XLMRobertaModel
-    ("intfloat/multilingual-e5-base", "CLS", DispatchPooler),
+    # arch: BertModel, sentence-transformers config says mean
+    ("sentence-transformers/all-MiniLM-L6-v2", "MEAN", DispatchPooler),
+    # arch: BertModel, sentence-transformers config says cls
+    ("BAAI/bge-small-en-v1.5", "CLS", DispatchPooler),
+    # arch: XLMRobertaModel, sentence-transformers config says mean
+    ("intfloat/multilingual-e5-base", "MEAN", DispatchPooler),
+    # arch: ModernBertModel
+    ("Alibaba-NLP/gte-modernbert-base", "CLS", DispatchPooler),
+    # arch: RobertaForMaskedLM
+    ("ehsanaghaei/SecureBERT", "CLS", DispatchPooler),
+    # arch: RobertaModel
+    ("princeton-nlp/sup-simcse-roberta-base", "CLS", DispatchPooler),
     # arch: RobertaForSequenceClassification
     ("cross-encoder/stsb-roberta-base", "CLS", RBLNClassifierPooler),
     # arch: XLMRobertaForSequenceClassification
@@ -72,15 +80,18 @@ ENCODER_MODELS = [
 ]
 
 
-def _build_encoder(model_id: str):
-    model_config = ModelConfig(model=model_id, dtype=torch.float32, seed=42)
-    # Mirror RBLNOptimumModelRunner: Qwen3 pooling models have their HF arch
-    # (Qwen3ForCausalLM) remapped to Qwen3Model before the encoder is built.
+def _build_encoder(model_id: str, pooler_config: PoolerConfig | None = None):
+    model_config = ModelConfig(
+        model=model_id, dtype=torch.float32, seed=42, pooler_config=pooler_config
+    )
+    # Mirror the platform's architecture remap before model loading.
     if is_qwen3_embedding(model_config):
         model_config.hf_config.__dict__["architectures"] = ["Qwen3Model"]
     vllm_config = VllmConfig(
         model_config=model_config,
-        cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+        cache_config=CacheConfig(
+            block_size=16, cache_dtype="auto", enable_prefix_caching=False
+        ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=2,
             max_num_batched_tokens=128,
@@ -90,16 +101,17 @@ def _build_encoder(model_id: str):
     )
 
     # Fake ONLY the optimum-rbln compile/load step (the only part that needs an
-    # NPU); everything else runs the real encoder __init__ / pooler setup.
+    # NPU); everything else runs the real model __init__ / pooler setup.
     def fake_init_model(self):
         self.model = MagicMock()
         self.model.get_kvcache_num_blocks.return_value = 1
+        self.rbln_model_config = SimpleNamespace()
 
     with (
         set_current_vllm_config(vllm_config),
         patch.object(RBLNOptimumModelBase, "init_model", fake_init_model),
     ):
-        return RBLNOptimumForEncoderModel(vllm_config=vllm_config)
+        return load_model(vllm_config)
 
 
 @pytest.mark.parametrize("model_id, expected_seq_pool, expected_pooler", ENCODER_MODELS)
@@ -109,6 +121,21 @@ def test_encoder_pooling(model_id, expected_seq_pool, expected_pooler):
     pooler_config = model.vllm_config.model_config.pooler_config
     assert pooler_config.seq_pooling_type == expected_seq_pool
     assert isinstance(model.pooler, expected_pooler)
+
+
+def test_bert_masked_lm_builds_a_token_classify_pooler():
+    model = _build_encoder("google-bert/bert-base-uncased")
+
+    assert model.pooler.get_supported_tasks() == {"token_classify"}
+
+
+def test_encoder_keeps_a_user_pooler_config():
+    # bge-small ships a CLS sentence-transformers config; the user's choice wins.
+    model = _build_encoder(
+        "BAAI/bge-small-en-v1.5", PoolerConfig(seq_pooling_type="MEAN")
+    )
+
+    assert model.vllm_config.model_config.pooler_config.seq_pooling_type == "MEAN"
 
 
 @pytest.mark.parametrize("classification", [False, True])
@@ -155,7 +182,9 @@ def _build_qwen3_vl_embedding():
     model_config.hf_config.__dict__["architectures"] = ["Qwen3VLModel"]
     vllm_config = VllmConfig(
         model_config=model_config,
-        cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+        cache_config=CacheConfig(
+            block_size=16, cache_dtype="auto", enable_prefix_caching=False
+        ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=1,
             max_num_batched_tokens=128,

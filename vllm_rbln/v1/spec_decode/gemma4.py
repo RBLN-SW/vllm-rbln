@@ -16,7 +16,6 @@ import torch.nn as nn
 from vllm.config import get_layers_from_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 
 from vllm_rbln.forward_context import set_forward_context
@@ -161,16 +160,14 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
         """The attention metadata every draft step of this batch shares.
 
         Each query sits at its request's last target position and sees the
-        keys up to it, within the window on a sliding layer. The op's write
-        position is one past it, where the zero K/V do no harm.
+        keys up to it, within the window on a sliding layer. The KV-shared
+        layers read the target's cache there and write nothing.
         """
         batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
             num_reqs, num_reqs, False, first_pass=False
         )
         num_reqs_padded = batch_desc.num_reqs_padded
         query_start_loc = self.arange[: num_reqs + 1]
-        write_positions = positions + 1
-        assert torch.all(write_positions < self.max_model_len)
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             builder = attn_group.get_metadata_builder()
@@ -179,7 +176,7 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
             common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
                 query_start_loc_cpu=query_start_loc,
-                seq_lens=write_positions + 1,
+                seq_lens=positions + 1,
                 num_reqs=num_reqs,
                 num_actual_tokens=num_reqs,
                 max_query_len=1,
@@ -189,38 +186,10 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
             )
             attn_metadata = builder.build(
                 common_attn_metadata=common_attn_metadata,
-                positions=write_positions,
+                positions=positions,
                 is_prefill=False,
                 batch_pad=num_reqs_padded,
-                skip_attn_masks=True,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
-            )
-            if isinstance(builder.kv_cache_spec, SlidingWindowSpec):
-                # sliding_window_attention_v1's key frame: the strip of
-                # blocks from the one holding the window's first key.
-                window = builder.kv_cache_spec.sliding_window
-                block_size = builder.block_size
-                num_blocks = (window + block_size) // block_size + 1
-                first_key = (
-                    torch.clamp(positions - window + 1, min=0)
-                    // block_size
-                    * block_size
-                )
-                keys = first_key[:, None] + torch.arange(num_blocks * block_size)
-                visible = (keys <= positions[:, None]) & (
-                    keys > positions[:, None] - window
-                )
-                masks = torch.zeros(num_reqs_padded, 1, 1, num_blocks * block_size)
-                masks[:num_reqs, 0, 0] = visible.to(masks.dtype)
-            else:
-                # gqa masks keys over the whole block table.
-                keys = torch.arange(block_table.shape[1] * builder.block_size)
-                visible = keys[None, :] <= positions[:, None]
-                masks = torch.zeros(num_reqs_padded, 1, 1, 1, keys.numel())
-                masks[:num_reqs, 0, 0, 0] = visible.to(masks.dtype)
-            attn_metadata.attn_masks = builder._stage(
-                masks.to(torch.float16 if builder.enforce_eager else torch.float32),
-                "attn_masks",
             )
             self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:

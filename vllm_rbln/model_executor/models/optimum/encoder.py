@@ -18,24 +18,17 @@ import torch
 from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
-from vllm.model_executor.layers.pooler.activations import (
-    PoolerNormalize,
-    resolve_classifier_act_fn,
+from vllm.model_executor.layers.pooler.activations import resolve_classifier_act_fn
+from vllm.model_executor.layers.pooler.tokwise import (
+    pooler_for_token_classify,
+    pooler_for_token_embed,
 )
-from vllm.model_executor.layers.pooler.seqwise import (
-    EmbeddingPoolerHead,
-    SequencePooler,
-    get_seq_pooling_method,
-)
-from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
 from vllm.model_executor.models import VllmModelForPooling
 from vllm.tasks import PoolingTask
 from vllm.v1.outputs import PoolerOutput
 from vllm.v1.pool.metadata import PoolingMetadata
 
-from vllm_rbln.utils.optimum.registry import is_decoder_pooling_arch
-
-from .base import ModelInputForRBLN
+from .base import ModelInputForRBLN, build_embedding_pooler
 from .model_base import RBLNOptimumModelBase
 
 logger = init_logger(__name__)
@@ -87,10 +80,6 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         super().__init__(vllm_config=vllm_config)
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
-        # Encoder-only models use CLS; decoder-based embedders keep their
-        # resolved pooling method (e.g. LAST for Qwen3 embedding).
-        if not is_decoder_pooling_arch(self.model_config.hf_config):
-            pooler_config.seq_pooling_type = "CLS"
         # https://github.com/vllm-project/vllm/blob/v0.22.0/docs/models/pooling_models/scoring.md
         # vLLM groups score()-capable models into three "score types"
         # (docs/models/pooling_models, score_types.svg). Which pooler we build
@@ -104,24 +93,15 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         # activation (RBLNClassifierPooler); others use the embed/token_embed pooler.
         if self.is_classification_arch():
             self.pooler = RBLNClassifierPooler(vllm_config.model_config)
+        elif self.model_config.hf_config.architectures[0] == "BertForMaskedLM":
+            # The compiled graph ends in the MLM head, so its output is already
+            # the per-token vocabulary logits upstream's BertForMaskedLM pools.
+            self.pooler = pooler_for_token_classify(pooler_config)
         else:
-            # Build the "embed" pooler without sentence-transformers projection.
-            # vllm's pooler_for_embed() loads the ST Dense layer via
-            # _load_st_projector, but RBLN encoder models produce raw hidden
-            # states — the projection is not part of the compiled model.
-            pooling = get_seq_pooling_method(pooler_config.get_seq_pooling_type())
-            embed_pooler = SequencePooler(
-                pooling=pooling,
-                head=EmbeddingPoolerHead(
-                    head_dtype=vllm_config.model_config.head_dtype,
-                    projector=None,
-                    activation=PoolerNormalize(),
-                ),
-            )
             self.pooler = DispatchPooler(
                 {
                     "token_embed": pooler_for_token_embed(pooler_config),
-                    "embed": embed_pooler,
+                    "embed": build_embedding_pooler(self.model_config),
                 },
             )
 

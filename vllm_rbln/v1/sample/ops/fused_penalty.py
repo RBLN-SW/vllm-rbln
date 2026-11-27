@@ -123,7 +123,8 @@ def keeps_logit_bias_order(sampling_metadata: SamplingMetadata) -> bool:
 
 
 class _Request:
-    """Append-only lane store of one request. Slots fill in first-seen order."""
+    """Lane store of one request. Slots fill in first-seen order, and only a
+    step's draft slots are ever taken back."""
 
     __slots__ = (
         "is_vocab_split",
@@ -233,7 +234,8 @@ class FusedPenaltyState:
 
     def __init__(self, base_buckets: Sequence[int] = K_BUCKETS):
         self.base_buckets = tuple(base_buckets)
-        self._reqs: dict[str, _Request] = {}
+        # Keyed by (request id, split layout).
+        self._reqs: dict[tuple[str, bool], _Request] = {}
         self._cidx: np.ndarray | None = None
         self._lanes: np.ndarray | None = None
 
@@ -246,6 +248,41 @@ class FusedPenaltyState:
     ) -> FusedPenaltyPlan | None:
         """The plan for this step, or None when the step keeps the upstream path."""
         num_rows, vocab_size = logits_shape
+        args = self._extract_update_args(sampling_metadata, input_batch, vocab_size)
+        if args is None:
+            return None
+        step = self.update(*args, vocab_size, num_rows)
+        if step is None:
+            return None
+        rows, row_vocab, k, cidx, lanes = step
+        return FusedPenaltyPlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
+
+    def _extract_update_args(
+        self,
+        sampling_metadata: SamplingMetadata,
+        input_batch: InputBatch,
+        vocab_size: int,
+    ) -> (
+        tuple[
+            Sequence[str],
+            Callable[[int], np.ndarray],
+            Sequence[Sequence[int]],
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+            dict[int, dict[int, float]],
+        ]
+        | None
+    ):
+        """`update`'s per-request arguments, read from the step.
+
+        Returns:
+            (req_ids, prompt_fn, output_token_ids, rep, freq, pres, biases):
+            the request ids, a function from a request's index to its prompt
+            tokens, each request's output tokens, the repetition, frequency
+            and presence penalty per request, and the logit bias per request
+            index. None when the step keeps the upstream path.
+        """
         holder = sampling_metadata.thinking_budget_state_holder
         if not supports_vocab(vocab_size) or (
             holder is not None and holder.has_tracked_requests()
@@ -278,7 +315,7 @@ class FusedPenaltyState:
         def prompt(i: int) -> np.ndarray:
             return input_batch.token_ids_cpu[i, : input_batch.num_prompt_tokens[i]]
 
-        step = self.update(
+        return (
             input_batch.req_ids[:n],
             prompt,
             outputs,
@@ -286,19 +323,83 @@ class FusedPenaltyState:
             freq,
             pres,
             biases,
-            vocab_size,
-            num_rows,
         )
+
+    def plan_with_drafts(
+        self,
+        sampling_metadata: SamplingMetadata,
+        input_batch: InputBatch,
+        num_draft_tokens: Sequence[int],
+        num_spec_tokens: int,
+        vocab_size: int,
+        device: torch.device,
+    ) -> FusedPenaltyPlan | None:
+        """The plan for a rejection-sampling step, or None to keep the upstream path.
+
+        Target rows, then bonus rows. A target row counts the drafts before it,
+        a bonus row every draft.
+        """
+        args = self._extract_update_args(sampling_metadata, input_batch, vocab_size)
+        if args is None:
+            return None
+        # Upstream rejects logit_bias with speculative decoding.
+        assert not args[6]
+        reqs = self._sync_requests(*args, vocab_size, False)
+        drafts = sampling_metadata.spec_token_ids
+        num_targets = len(num_draft_tokens) * num_spec_tokens
+        rows: list[_Request | None] = [None] * (num_targets + len(num_draft_tokens))
+        edits: dict[int, list[tuple[int, int, int, int, float]]] = {}
+        first_target = 0
+        # A draft takes a slot for this step only. Its slots are the newest.
+        num_slots = [req.used for req in reqs]
+        try:
+            for i, req in enumerate(reqs):
+                count = num_draft_tokens[i]
+                rows[num_targets + i] = req
+                if req.has_penalties:
+                    if drafts is None or len(drafts[i]) != count:
+                        return None
+                    # Not an output yet: edit the step buffer only.
+                    row_edits: list[tuple[int, int, int, int, float]] = []
+                    draft_token_counts: dict[int, int] = {}
+                    for pos, t in enumerate(drafts[i]):
+                        if not 0 <= t < vocab_size:
+                            return None
+                        rows[first_target + pos] = req
+                        edits[first_target + pos] = list(row_edits)
+                        lane_pos = req._lane(t)
+                        if req.has_repetition_penalty:
+                            row_edits.append(
+                                (*lane_pos, MUL, float(req.repetition_penalty))
+                            )
+                        if req.frequency_penalty or req.presence_penalty:
+                            c = draft_token_counts[t] = draft_token_counts.get(t, 0) + 1
+                            c += req.output_token_counts.get(t, 0)
+                            sub = req.frequency_penalty * c + req.presence_penalty
+                            if abs(sub) > _FP16_MAX:
+                                return None
+                            row_edits.append((*lane_pos, SUB, sub))
+                    edits[num_targets + i] = row_edits
+                first_target += count
+            step = self._fit_and_copy_out(rows, vocab_size, len(rows), edits)
+        finally:
+            for req, n in zip(reqs, num_slots):
+                slots = req.chunk_to_slot_by_row[0]
+                for chunk in list(slots)[n:]:
+                    del slots[chunk]
         if step is None:
             return None
-        rows, row_vocab, k, cidx, lanes = step
-        return FusedPenaltyPlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
+        num_rows, row_vocab, k, cidx, lanes = step
+        return FusedPenaltyPlan(
+            num_rows, row_vocab, k, cidx.to(device), lanes.to(device)
+        )
 
     def forget(self, req_ids: Iterable[str]) -> None:
         """Drop finished requests. A step lists only the requests it schedules,
         so absence from one step does not mean a request is gone."""
         for rid in req_ids:
-            self._reqs.pop(rid, None)
+            self._reqs.pop((rid, False), None)
+            self._reqs.pop((rid, True), None)
 
     def k_buckets(self, logits_shape: torch.Size) -> tuple[int, ...]:
         """Every `k` a plan for `logits_shape` can take."""
@@ -309,7 +410,9 @@ class FusedPenaltyState:
     ) -> FusedPenaltyPlan:
         """A plan that changes nothing, at chunk-slot count `k`. Used for warm-up."""
         num_rows, vocab_size = logits_shape
-        rows, row_vocab, k, cidx, lanes = self._copy_out([], vocab_size, num_rows, k)
+        rows, row_vocab, k, cidx, lanes = self._copy_out(
+            [], vocab_size, num_rows, k, {}
+        )
         return FusedPenaltyPlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
 
     def update(
@@ -331,14 +434,38 @@ class FusedPenaltyState:
         `k` is the smallest bucket that fits the live requests. None when one of
         them uses more chunks than any bucket holds.
         """
-        split = num_rows == 1
+        reqs = self._sync_requests(
+            req_ids,
+            prompt_fn,
+            output_token_ids,
+            rep,
+            freq,
+            pres,
+            biases,
+            vocab_size,
+            num_rows == 1,
+        )
+        return self._fit_and_copy_out(reqs, vocab_size, num_rows, {})
+
+    def _sync_requests(
+        self,
+        req_ids: Sequence[str],
+        prompt_fn: Callable[[int], np.ndarray],
+        output_token_ids: Sequence[Sequence[int]],
+        rep: np.ndarray,
+        freq: np.ndarray,
+        pres: np.ndarray,
+        biases: dict[int, dict[int, float]],
+        vocab_size: int,
+        split: bool,
+    ) -> list[_Request]:
+        """Add the outputs since the last step to each request's lanes."""
+        reqs = []
         for i, rid in enumerate(req_ids):
             outs = output_token_ids[i] if i < len(output_token_ids) else ()
             n_out = len(outs)
-            req = self._reqs.get(rid)
-            if req is not None and (
-                req.is_vocab_split != split or n_out < req.num_processed_output_tokens
-            ):
+            req = self._reqs.get((rid, split))
+            if req is not None and n_out < req.num_processed_output_tokens:
                 req = None
             # Tokens already written are all resolved ids.
             start = req.num_processed_output_tokens if req is not None else 0
@@ -347,7 +474,7 @@ class FusedPenaltyState:
                     n_out = j
                     break
             if req is None:
-                req = self._reqs[rid] = _Request(
+                req = self._reqs[rid, split] = _Request(
                     split,
                     vocab_size,
                     self.base_buckets[0],
@@ -376,17 +503,24 @@ class FusedPenaltyState:
                 if 0 <= t < vocab_size:
                     req.add_output(int(t))
             req.num_processed_output_tokens = n_out
+            reqs.append(req)
+        return reqs
 
-        if not all(self._reqs[rid].fits for rid in req_ids):
+    def _fit_and_copy_out(self, reqs, vocab_size, num_rows, edits):
+        """`_copy_out` at the smallest k that fits `reqs`, None when none does."""
+        live = [req for req in reqs if req is not None]
+        if not all(req.fits for req in live):
             return None
-        need = max((self._reqs[rid].used for rid in req_ids), default=0)
+        need = max((req.used for req in live), default=0)
         row_vocab = row_layout(num_rows, vocab_size)[1]
         k = next((b for b in k_buckets(row_vocab, self.base_buckets) if b >= need), 0)
         if not k:
             return None
-        return self._copy_out(req_ids, vocab_size, num_rows, k)
+        return self._copy_out(reqs, vocab_size, num_rows, k, edits)
 
-    def _copy_out(self, req_ids, vocab_size, num_rows, k):
+    def _copy_out(self, reqs, vocab_size, num_rows, k, edits):
+        """Fill the step buffers. `reqs[i]` is row i's request or None, and
+        `edits[i]` its (row, slot, lane, parameter, value) overrides."""
         rows, row_vocab = row_layout(num_rows, vocab_size)
         per_req = rows // num_rows
         if (
@@ -400,7 +534,7 @@ class FusedPenaltyState:
         cidx, lanes = self._cidx[:rows], self._lanes[:rows]
         for out in range(rows):
             i, r = divmod(out, per_req)
-            req = self._reqs[req_ids[i]] if i < len(req_ids) else None
+            req = reqs[i] if i < len(reqs) else None
             n = len(req.chunk_to_slot_by_row[r]) if req is not None else 0
             if n == 0:
                 cidx[out] = 0
@@ -410,7 +544,11 @@ class FusedPenaltyState:
             cidx[out, :n] = req.chunk_indices[r, :n]
             cidx[out, n:] = req.chunk_indices[r, 0]
             lanes[out, :, :n] = req.lanes[r, :, :n]
-            lanes[out, :, n:] = req.lanes[r, :, :1]
+            for token_row, slot, lane, parameter, value in edits.get(i, ()):
+                if token_row == r:
+                    lanes[out, parameter, slot, lane] = value
+            # After the edits, so slot 0's duplicates carry them.
+            lanes[out, :, n:] = lanes[out, :, :1]
         return (
             rows,
             row_vocab,

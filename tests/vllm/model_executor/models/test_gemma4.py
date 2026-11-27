@@ -33,6 +33,7 @@ import vllm_rbln.model_executor.models.gemma4 as gemma4
 from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
+from vllm_rbln.utils import BufferedVisionEncoder
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
 POOL = 3
@@ -49,7 +50,7 @@ def _bare_model(**attrs) -> RBLNGemma4ForConditionalGeneration:
     )
     nn.Module.__init__(model)
     model.mm_prefix_attn_layers = []
-    object.__setattr__(model, "_mm_encoder", None)
+    model._mm_encoder = None
     for key, value in attrs.items():
         setattr(model, key, value)
     return model
@@ -96,16 +97,70 @@ def test_logits_processor_delegates_to_language_model():
     assert model.logits_processor is processor
 
 
-def test_the_vision_encoder_matches_hfs():
-    # The encoder pads every image to its bucket and masks the padding keys;
-    # what comes back must be HF's soft tokens for the image alone.
-    tower = _vision_tower()
+def _model_with_vision_encoder(tower):
     model = _bare_model(
         vision_tower=tower,
         embed_vision=_Identity(),
         model_dtype=torch.float32,
         mm_encoder_patch_buckets=[90],
     )
+    model._mm_encoder = BufferedVisionEncoder(
+        gemma4._RBLNGemma4VisionEncoder(tower, model.embed_vision).eval(),
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=model.model_dtype,
+    )
+    return model
+
+
+@pytest.mark.parametrize("valid_rows", [[0, 1, 2], [0, 2, 5]])
+def test_vision_encoder_stages_valid_patches_in_order(monkeypatch, valid_rows):
+    pixels = torch.arange(18, dtype=torch.bfloat16).view(6, 3)
+    positions = torch.full((6, 2), -1)
+    positions[valid_rows] = torch.tensor([[2, 0], [1, 0], [0, 0]])
+    expected = pixels[valid_rows]
+    stage = Mock(side_effect=lambda bucket, inputs, num_valid: inputs)
+
+    encoder = BufferedVisionEncoder(
+        lambda patches, *_: (patches[0].clone(),),
+        specs_by_bucket={
+            6: [
+                gemma4.rbln_utils.EncoderInput(
+                    "pixel_values",
+                    (1, 6, 3),
+                    axis=1,
+                    pad=0.0,
+                    dtype=torch.float32,
+                    use_registered_host_buffer=True,
+                )
+            ]
+        },
+        device="cpu",
+        dtype=pixels.dtype,
+    )
+    monkeypatch.setattr(encoder.input_buffers, "stage", stage)
+    model = _bare_model(
+        vision_tower=SimpleNamespace(config=SimpleNamespace(pooling_kernel_size=1)),
+        model_dtype=pixels.dtype,
+        mm_encoder_patch_buckets=[6],
+        _mm_encoder=encoder,
+    )
+
+    torch.testing.assert_close(model._encode_vision(pixels, positions), expected)
+    bucket, inputs, num_valid = stage.call_args.args
+    assert bucket == 6 and num_valid == len(valid_rows)
+    patches, staged_positions, *_ = inputs
+    assert (patches.data_ptr() == pixels.data_ptr()) == (valid_rows == [0, 1, 2])
+    torch.testing.assert_close(staged_positions[0, :num_valid], positions[valid_rows])
+
+
+def test_the_vision_encoder_matches_hfs():
+    # The encoder pads every image to its bucket and masks the padding keys;
+    # what comes back must be HF's soft tokens for the image alone.
+    tower = _vision_tower()
+    model = _model_with_vision_encoder(tower)
     pixels, positions = _image(9, 9, num_patches=81)
 
     with torch.no_grad():
@@ -118,16 +173,33 @@ def test_the_vision_encoder_matches_hfs():
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
 
 
+def test_a_smaller_image_matches_upstream_when_reusing_vision_buffers(monkeypatch):
+    tower = _vision_tower()
+    model = _model_with_vision_encoder(tower)
+    encode = Mock(wraps=gemma4.rbln_utils.run_mm_encoder)
+    monkeypatch.setattr(gemma4.rbln_utils, "run_mm_encoder", encode)
+    large_pixels, large_positions = _image(9, 9, num_patches=90)
+    small_pixels, small_positions = _image(6, 3, num_patches=90)
+
+    with torch.inference_mode():
+        model._encode_vision(large_pixels, large_positions)
+        actual = model._encode_vision(small_pixels, small_positions)
+        expected = tower(
+            pixel_values=small_pixels[None], pixel_position_ids=small_positions[None]
+        ).last_hidden_state
+
+    large_inputs, small_inputs = (call.args[1] for call in encode.call_args_list)
+    assert [x.data_ptr() for x in small_inputs] == [x.data_ptr() for x in large_inputs]
+    torch.testing.assert_close(small_inputs[0][0, 18:81], large_pixels[18:81])
+    assert actual.shape == (2, 32)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
 def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
     # The encoder looks up HF's cos and sin for each patch in the graph, so the
     # host computes none per image and the soft tokens stay HF's.
     tower = _vision_tower()
-    model = _bare_model(
-        vision_tower=tower,
-        embed_vision=_Identity(),
-        model_dtype=torch.float32,
-        mm_encoder_patch_buckets=[90],
-    )
+    model = _model_with_vision_encoder(tower)
     first, second = _image(6, 3, num_patches=81), _image(3, 9, num_patches=81)
     with torch.no_grad():
         model._encode_vision(*first)
@@ -183,7 +255,14 @@ def _recording_model(buckets):
         mm_encoder_patch_buckets=buckets,
         config=SimpleNamespace(vision_config=tower.config),
     )
-    object.__setattr__(model, "_mm_encoder", encoder)
+    model._mm_encoder = BufferedVisionEncoder(
+        encoder,
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=model.model_dtype,
+    )
     return model, calls
 
 
@@ -227,9 +306,32 @@ def test_warm_up_runs_every_bucket_once_full():
     assert calls == [(18, 18), (45, 45), (90, 90)]
 
 
-def _built_model(
-    monkeypatch, *, cap, budgets, chunk=512, per_layer_input=0, attention_layers=()
+def _vllm_config(
+    *,
+    budgets,
+    chunk=512,
+    per_layer_input=0,
+    limits=None,
 ):
+    limits = {"image": 1, "video": 1} if limits is None else limits
+    mm_config = SimpleNamespace(get_limit_per_prompt=lambda m: limits.get(m, 0))
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        speculative_config=None,
+        model_config=SimpleNamespace(
+            max_model_len=32768,
+            get_multimodal_config=lambda: mm_config,
+            hf_config=SimpleNamespace(
+                text_config=SimpleNamespace(hidden_size_per_layer_input=per_layer_input)
+            ),
+        ),
+        additional_config=RBLNConfig(
+            encoder_token_budgets=budgets, prefill_chunk_size=[chunk]
+        ),
+    )
+
+
+def _built_model(monkeypatch, *, default, attention_layers=(), **config):
     """The model as construction resolves it, upstream's model left out."""
 
     def upstream_init(self, **kwargs):
@@ -241,7 +343,7 @@ def _built_model(
         "__init__",
         upstream_init,
     )
-    monkeypatch.setattr(gemma4, "mm_soft_token_cap", lambda info: cap)
+    monkeypatch.setattr(gemma4, "mm_soft_token_default", lambda info: default)
     monkeypatch.setattr(
         gemma4,
         "MULTIMODAL_REGISTRY",
@@ -253,23 +355,7 @@ def _built_model(
         RBLNGemma4ForConditionalGeneration
     )
     model.config = SimpleNamespace(vision_config=SimpleNamespace(pooling_kernel_size=3))
-    model.__init__(
-        vllm_config=SimpleNamespace(
-            parallel_config=SimpleNamespace(data_parallel_size=1),
-            speculative_config=None,
-            model_config=SimpleNamespace(
-                max_model_len=32768,
-                hf_config=SimpleNamespace(
-                    text_config=SimpleNamespace(
-                        hidden_size_per_layer_input=per_layer_input
-                    )
-                ),
-            ),
-            additional_config=RBLNConfig(
-                encoder_token_budgets=budgets, prefill_chunk_size=[chunk]
-            ),
-        )
-    )
+    model.__init__(vllm_config=_vllm_config(**config))
     return model
 
 
@@ -283,7 +369,7 @@ def test_mm_prefix_mask_selects_only_sliding_layers(monkeypatch, use_mm_prefix):
         layer.attn = SimpleNamespace(use_mm_prefix=use_mm_prefix)
         layers.append(layer)
 
-    model = _built_model(monkeypatch, cap=280, budgets=[], attention_layers=layers)
+    model = _built_model(monkeypatch, default=280, budgets=[], attention_layers=layers)
 
     assert model.layers[0].attn.use_mm_prefix == use_mm_prefix
     assert model.layers[1].attn.use_mm_prefix == use_mm_prefix
@@ -297,40 +383,55 @@ def test_mm_prefix_mask_selects_only_sliding_layers(monkeypatch, use_mm_prefix):
 def test_the_encoder_buckets_follow_encoder_token_budgets(
     monkeypatch, budgets, buckets
 ):
-    model = _built_model(monkeypatch, cap=280, budgets=budgets)
+    model = _built_model(monkeypatch, default=280, budgets=budgets)
     assert model.mm_encoder_patch_buckets == buckets
 
 
-def test_unset_budgets_follow_the_prefill_chunk_not_the_cap(monkeypatch):
-    model = _built_model(monkeypatch, cap=280, budgets=[], chunk=2048)
+def test_unset_budgets_follow_the_prefill_chunk_not_the_default(monkeypatch):
+    model = _built_model(monkeypatch, default=280, budgets=[], chunk=2048)
     assert model.mm_encoder_patch_buckets == [
         budget * 9 for budget in (70, 140, 280, 560, 1120)
     ]
 
 
-def test_a_cap_above_the_prefill_chunk_is_refused_with_unset_budgets(monkeypatch):
-    with pytest.raises(ValueError, match="must reach max_soft_tokens=560"):
-        _built_model(monkeypatch, cap=560, budgets=[], chunk=512)
+def test_a_chunk_holding_no_budget_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match=r"chunk \(64\) holds no Gemma4"):
+        _built_model(monkeypatch, default=280, budgets=[], chunk=64)
 
 
-def test_the_longest_range_is_the_cap_not_the_largest_budget(monkeypatch):
-    model = _built_model(monkeypatch, cap=280, budgets=[560, 70])
-    assert model.max_mm_prefix_range_len == 280
+def test_text_only_serving_resolves_no_budgets(monkeypatch):
+    # No image can arrive, so neither a short chunk nor the default matters.
+    model = _built_model(monkeypatch, default=280, budgets=[], chunk=64, limits={})
+    assert model.mm_encoder_patch_buckets == []
 
 
-def test_budgets_that_cannot_encode_an_image_at_the_cap_are_refused(monkeypatch):
-    with pytest.raises(ValueError, match="must reach max_soft_tokens=280"):
-        _built_model(monkeypatch, cap=280, budgets=[70, 140])
+def test_video_only_serving_skips_the_image_default(monkeypatch):
+    model = _built_model(monkeypatch, default=560, budgets=[70], limits={"video": 1})
+    assert model.mm_encoder_patch_buckets == [70 * 9]
+
+
+@pytest.mark.parametrize("budgets, chunk", [([], 512), ([70, 140], 2048)])
+def test_a_default_above_the_largest_budget_is_refused(monkeypatch, budgets, chunk):
+    with pytest.raises(ValueError, match=r"max_soft_tokens=560, .* above (280|140)"):
+        _built_model(monkeypatch, default=560, budgets=budgets, chunk=chunk)
+
+
+def test_the_longest_range_is_the_largest_budget_not_the_default():
+    # Requests may ask for any compiled budget, whatever the engine's default.
+    vllm_config = _vllm_config(budgets=[560, 70])
+    assert (
+        RBLNGemma4ForConditionalGeneration.max_mm_prefix_range_len(vllm_config) == 560
+    )
 
 
 def test_budgets_the_processor_never_emits_are_refused(monkeypatch):
     with pytest.raises(ValueError, match=r"\[100, 300\] are not Gemma4"):
-        _built_model(monkeypatch, cap=280, budgets=[300, 100, 280])
+        _built_model(monkeypatch, default=280, budgets=[300, 100, 280])
 
 
 def test_variants_with_per_layer_inputs_are_refused(monkeypatch):
     with pytest.raises(ValueError, match="per-layer inputs"):
-        _built_model(monkeypatch, cap=280, budgets=[], per_layer_input=256)
+        _built_model(monkeypatch, default=280, budgets=[], per_layer_input=256)
 
 
 @pytest.mark.parametrize("scale_first", [True, False])
@@ -373,56 +474,25 @@ def _processing_info(engine_kwargs, processor_default, default_output_length):
 
 def test_the_engines_budget_overrides_the_processors():
     info = _processing_info({"images_kwargs": {"max_soft_tokens": 1120}}, 280, 280)
-    assert gemma4.mm_soft_token_cap(info) == 1120
+    assert gemma4.mm_soft_token_default(info) == 1120
 
 
 def test_a_default_output_length_the_processor_ignores_is_refused():
     # HF would cut a 280-token image that upstream counts as 70.
     info = _processing_info({}, 280, 70)
     with pytest.raises(ValueError, match="--mm-processor-kwargs"):
-        gemma4.mm_soft_token_cap(info)
+        gemma4.mm_soft_token_default(info)
     info = _processing_info({"max_soft_tokens": 70}, 280, 70)
-    assert gemma4.mm_soft_token_cap(info) == 70
+    assert gemma4.mm_soft_token_default(info) == 70
 
 
 def test_an_unsupported_budget_is_refused():
     info = _processing_info({"max_soft_tokens": 100}, 280, 280)
     with pytest.raises(ValueError, match="not one of"):
-        gemma4.mm_soft_token_cap(info)
+        gemma4.mm_soft_token_default(info)
 
 
-@pytest.mark.parametrize(
-    "num_images, request_kwargs, refused",
-    [
-        (1, {"max_soft_tokens": 560}, True),
-        (1, {"max_soft_tokens": 280}, False),
-        (1, {}, False),
-        # Video frames take their own budget whatever the request says.
-        (0, {"max_soft_tokens": 560}, False),
-    ],
-)
-def test_a_request_budget_above_the_cap_is_refused(
-    monkeypatch, num_images, request_kwargs, refused
-):
-    upstream = Mock(return_value="processed")
-    monkeypatch.setattr(
-        gemma4.Gemma4MultiModalProcessor, "_apply_hf_processor_main", upstream
-    )
-    processor = gemma4.RBLNGemma4MultiModalProcessor.__new__(
-        gemma4.RBLNGemma4MultiModalProcessor
-    )
-    processor.info = _processing_info({}, 280, 280)
-    items = SimpleNamespace(get_count=lambda modality, strict: num_images)
-
-    if refused:
-        with pytest.raises(ValueError, match="--mm-processor-kwargs"):
-            processor._apply_hf_processor_main(items, request_kwargs)
-        upstream.assert_not_called()
-    else:
-        assert processor._apply_hf_processor_main(items, request_kwargs) == "processed"
-
-
-def test_construction_builds_the_hf_processor_of_every_allowed_budget(monkeypatch):
+def test_construction_builds_the_hf_processor_of_every_budget(monkeypatch):
     # Upstream caches the HF processor per max_soft_tokens; building each one
     # up front keeps a request's first use of a budget from paying for it.
     info = _processing_info({}, 280, 280)
@@ -441,7 +511,13 @@ def test_construction_builds_the_hf_processor_of_every_allowed_budget(monkeypatc
     monkeypatch.setattr(gemma4.Gemma4MultiModalProcessor, "__init__", upstream_init)
     gemma4.RBLNGemma4MultiModalProcessor()
 
-    assert [kwargs["max_soft_tokens"] for kwargs in built if kwargs] == [70, 140, 280]
+    assert [kwargs["max_soft_tokens"] for kwargs in built if kwargs] == [
+        70,
+        140,
+        280,
+        560,
+        1120,
+    ]
 
 
 def test_video_frames_are_regrouped_per_video(monkeypatch):
@@ -463,7 +539,7 @@ def test_video_frames_are_regrouped_per_video(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "first_rank, limits, compiled",
+    "first_rank, limits, has_encoder",
     [
         (True, {"image": 1, "video": 0}, True),
         (True, {"image": 0, "video": 1}, True),
@@ -472,7 +548,7 @@ def test_video_frames_are_regrouped_per_video(monkeypatch):
     ],
 )
 def test_the_encoder_compiles_only_where_the_tower_lives(
-    monkeypatch, first_rank, limits, compiled
+    monkeypatch, first_rank, limits, has_encoder
 ):
     monkeypatch.setattr(
         gemma4, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank)
@@ -482,8 +558,11 @@ def test_the_encoder_compiles_only_where_the_tower_lives(
         gemma4, "_RBLNGemma4VisionEncoder", lambda tower, embed_vision: built
     )
     model = _bare_model(
-        vision_tower=nn.Identity(),
+        # A tower with a parameter: the input buffers take its device.
+        vision_tower=nn.Linear(1, 1),
         embed_vision=nn.Identity(),
+        model_dtype=torch.float32,
+        mm_encoder_patch_buckets=[],
         multimodal_config=SimpleNamespace(
             get_limit_per_prompt=lambda modality: limits.get(modality, 0)
         ),
@@ -493,10 +572,11 @@ def test_the_encoder_compiles_only_where_the_tower_lives(
 
     model.compile_mm_encoder(compile_fn)
 
-    if compiled:
+    if has_encoder:
         compile_fn.assert_called_once_with(built)
-        assert model._mm_encoder is runtime
+        assert model._mm_encoder.encoder is runtime
     else:
+        model.warmup_mm_encoder()
         compile_fn.assert_not_called()
         assert model._mm_encoder is None
 

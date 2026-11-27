@@ -64,6 +64,9 @@ _NO_FLAG = {"no_flag": True}
 # something derived from the artifact the key is looking for.
 _DERIVED = {"no_flag": True, "derived": True}
 
+# Sampler graphs compile with use_cache=False, so they never enter the bundle.
+_UNHASHED_SAMPLER_FIELDS = frozenset({"use_custom_sampler", "use_fused_sampling"})
+
 ModelImpl = Literal["vllm", "optimum"]
 
 DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
@@ -76,6 +79,11 @@ class RBLNConfigBase:
 
     use_custom_sampler: bool = True
     """Use the customized RBLN sampler."""
+
+    use_fused_sampling: bool = False
+    """Run the sampling step's logits processing inside the compiled sampling
+    graph: repetition / frequency / presence penalties and logit bias, on the
+    vocab chunks they touch, and min_p. Needs `use_custom_sampler`."""
 
     sub_block_size: int | None = Field(default=None, gt=0)
     """Token granularity for prefix cache hit calculation.
@@ -117,11 +125,6 @@ class RBLNConfig(RBLNConfigBase):
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
-    use_fused_sampling: bool = False
-    """Run the sampling step's logits processing inside the compiled sampling
-    graph: repetition / frequency / presence penalties and logit bias, on the
-    vocab chunks they touch, and min_p. Needs `use_custom_sampler`."""
-
     prefill_chunk_size: list[int] | None = None
     """Lengths the prefill graphs are compiled at. A prefill step runs the
     shortest that holds its chunk, and the longest is the longest prefill chunk
@@ -159,10 +162,10 @@ class RBLNConfig(RBLNConfigBase):
     encoder_token_budgets: list[int] = field(default_factory=list)
     """Output-token capacities of compiled encoder graphs, shared across modalities.
     Empty lets the model choose: MiniMax-M3 takes the processor upper bounds of
-    the enabled modalities, Gemma4 every supported soft token budget up to
-    max_soft_tokens, Qwen3.5 powers of two from 128 up to the longest prefill
-    chunk (512 at least) and the processor upper bound for an image or a
-    video frame."""
+    the enabled modalities, Gemma4 every supported soft token budget one prefill
+    step holds (the largest is the most a request's image may take), Qwen3.5
+    powers of two from 128 up to the longest prefill chunk (512 at least) and
+    the processor upper bound for an image or a video frame."""
 
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
@@ -181,11 +184,8 @@ class RBLNConfig(RBLNConfigBase):
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
-        ignored_factors = {
-            # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle. Sub-block caching changes what runs, not what is built.
-            "use_custom_sampler",
-            "use_fused_sampling",
+        ignored_factors = _UNHASHED_SAMPLER_FIELDS | {
+            # Sub-block caching changes what runs, not what is built.
             "enable_sub_block_cache",
             "sub_block_size",
             "encoder_token_budgets",
@@ -320,12 +320,8 @@ class OptimumRBLNConfig(RBLNConfigBase):
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
-        ignored_factors = {
+        ignored_factors = _UNHASHED_SAMPLER_FIELDS | {
             f.name for f in _fields_of(type(self)) if f.metadata.get("derived")
-        } | {
-            # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle.
-            "use_custom_sampler",
         }
         return hash_factors(get_hash_factors(self, ignored_factors))
 

@@ -581,15 +581,6 @@ class TestRejectedConfigs:
             )
 
         reconfigure(bf16_forced_to_fp32)
-        if platform.USE_DEVICE_TENSOR:
-
-            def fp32_forced_to_fp16(config):
-                glm5_next(block_size=8192)(config)
-                config.model_config.dtype = torch.float32
-                config.model_config.enforce_eager = True
-
-            with pytest.raises(ValueError, match="whole KDA head states"):
-                reconfigure(fp32_forced_to_fp16)
 
     def test_glm5_next_prefix_caching_with_mtp_needs_retention_0(self, reconfigure):
         # A KDA verify step leaves no state at the end of a block it crossed, so
@@ -612,6 +603,24 @@ class TestRejectedConfigs:
         assert not config.cache_config.enable_prefix_caching
         assert config.cache_config.mamba_cache_mode == "none"
         assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
+    @pytest.mark.parametrize("gemma4_mtp", [True, False])
+    def test_gemma4_mtp_keeps_the_last_block_of_a_prefix_hit(
+        self, reconfigure, gemma4_mtp
+    ):
+        # Only the Gemma4 MTP assistant writes no KV of its own; another Gemma4
+        # drafter keeps the EAGLE block drop.
+        def gemma4(config):
+            config.model_config.hf_text_config.model_type = "gemma4_text"
+            config.speculative_config = SimpleNamespace(
+                method="mtp",
+                num_speculative_tokens=4,
+                use_gemma4_mtp=lambda: gemma4_mtp,
+                disable_eagle_block_drop=False,
+            )
+
+        config = reconfigure(gemma4)
+        assert config.speculative_config.disable_eagle_block_drop is gemma4_mtp
 
     def test_glm5_next_mtp_takes_16_bit_activations(self, reconfigure):
         def forced_to_fp32(config):
@@ -688,6 +697,14 @@ class TestRejectedConfigs:
 
             with pytest.raises(ValueError, match="single rank"):
                 reconfigure(widened)
+
+    def test_gdn_models_run_unquantized(self, reconfigure, gdn):
+        def fp8(config):
+            gdn(config)
+            config.model_config.quantization = "fp8"
+
+        with pytest.raises(ValueError, match="unquantized"):
+            reconfigure(fp8)
 
     @pytest.mark.parametrize("model", ["gdn", "glm5_next"])
     def test_recurrent_state_models_speculate_with_their_mtp_head_only(
@@ -1385,16 +1402,28 @@ class TestCacheOverrides:
 
 
 class TestEnforceEager:
-    def test_outcome_follows_the_device_lane(self, reconfigure):
-        mutate = lambda config: setattr(  # noqa: E731
-            config.model_config, "enforce_eager", True
-        )
-        if platform.USE_DEVICE_TENSOR:
-            # Eager needs real device tensors; dtype is forced to fp16 there.
-            assert reconfigure(mutate).model_config.dtype == torch.float16
-        else:
-            with pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR"):
-                reconfigure(mutate)
+    def test_rejects_target_eager(self, reconfigure):
+        def mutate(config):
+            config.model_config.enforce_eager = True
+
+        with pytest.raises(
+            ValueError,
+            match="--enforce-eager is not supported on RBLN",
+        ):
+            reconfigure(mutate)
+
+    def test_rejects_draft_eager(self, reconfigure):
+        def mutate(config):
+            config.speculative_config = SimpleNamespace(
+                method="eagle", enforce_eager=True
+            )
+
+        with pytest.raises(
+            ValueError,
+            match=r"speculative_config\.enforce_eager is not supported "
+            "with the 'vllm' model impl",
+        ):
+            reconfigure(mutate)
 
 
 def _selector(*, use_mla: bool = False, use_sparse: bool = False) -> SimpleNamespace:
@@ -1760,6 +1789,89 @@ class TestStrictProducerRequests:
     def test_kv_offloading_turns_a_producer_into_a_role_that_decodes(self):
         # Upstream rewrites the role to kv_both after the platform hook runs.
         self._validate("kv_producer", 4, kv_offloading_size=1)
+
+
+class TestMmPrefixRangeRequests:
+    """The frontend refuses an mm prefix range longer than the compiled graphs
+    hold, which the scheduler would otherwise assert on."""
+
+    @staticmethod
+    def _validate(monkeypatch, placeholders, **engine_kwargs):
+        from vllm.config import ModelConfig
+        from vllm.model_executor import model_loader
+        from vllm.sampling_params import SamplingParams
+
+        from vllm_rbln.model_executor.models.gemma4 import (
+            RBLNGemma4ForConditionalGeneration,
+        )
+
+        _build(**engine_kwargs)
+        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
+        monkeypatch.setattr(
+            model_loader,
+            "get_model_architecture",
+            lambda model_config: (RBLNGemma4ForConditionalGeneration, "Gemma4"),
+        )
+        RblnPlatform.validate_request(
+            {"mm_placeholders": placeholders}, SamplingParams()
+        )
+
+    @staticmethod
+    def _image(length):
+        from vllm.multimodal.inputs import PlaceholderRange
+
+        return {"image": [PlaceholderRange(offset=4, length=length)]}
+
+    def test_an_image_at_the_largest_compiled_budget_is_taken(self, monkeypatch):
+        # A 128-token chunk compiles the 70 budget only.
+        self._validate(monkeypatch, self._image(70))
+
+    def test_an_image_above_the_largest_compiled_budget_is_refused(self, monkeypatch):
+        from vllm.exceptions import VLLMValidationError
+
+        with pytest.raises(VLLMValidationError, match="140 tokens is above 70"):
+            self._validate(monkeypatch, self._image(140))
+
+    @pytest.mark.parametrize("length, refused", [(560, False), (1120, True)])
+    def test_the_ceiling_follows_the_longest_chunk(self, monkeypatch, length, refused):
+        from vllm.exceptions import VLLMValidationError
+
+        # A 1024-token chunk compiles budgets up to 560; the check reads the
+        # compiled ceiling, never the engine's max_soft_tokens default.
+        def validate():
+            self._validate(
+                monkeypatch,
+                self._image(length),
+                max_num_batched_tokens=1024,
+                additional_config={"prefill_chunk_size": [128, 1024]},
+            )
+
+        if refused:
+            with pytest.raises(VLLMValidationError, match="1120 tokens is above 560"):
+                validate()
+        else:
+            validate()
+
+    def test_video_frames_are_checked_one_by_one(self, monkeypatch):
+        from vllm.multimodal.inputs import PlaceholderRange
+
+        # Three 70-token frames, each behind two timestamp tokens.
+        frame = [False, False] + [True] * 70
+        video = PlaceholderRange(
+            offset=4, length=3 * len(frame), is_embed=torch.tensor(frame * 3)
+        )
+        self._validate(monkeypatch, {"video": [video]})
+
+    def test_a_video_frame_above_the_ceiling_is_refused(self, monkeypatch):
+        from vllm.exceptions import VLLMValidationError
+        from vllm.multimodal.inputs import PlaceholderRange
+
+        frame = [False, False] + [True] * 140
+        video = PlaceholderRange(
+            offset=4, length=len(frame), is_embed=torch.tensor(frame)
+        )
+        with pytest.raises(VLLMValidationError, match="Video range of 140 tokens"):
+            self._validate(monkeypatch, {"video": [video]})
 
 
 # Resolving the vllm path reads the host's device now that RBLN-CA* refuses it,

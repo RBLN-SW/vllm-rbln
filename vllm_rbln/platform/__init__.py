@@ -399,6 +399,9 @@ class RblnPlatform(Platform):
                 "on an EC consumer."
             )
 
+        if vllm_config.model_config.enforce_eager:
+            raise ValueError("--enforce-eager is not supported on RBLN.")
+
         _impl().check_and_update(vllm_config)
 
         parallel_config = vllm_config.parallel_config
@@ -415,7 +418,7 @@ class RblnPlatform(Platform):
         processed_inputs: "EngineInput",
         params: "SamplingParams | PoolingParams",
     ) -> None:
-        _impl().validate_request(params)
+        _impl().validate_request(processed_inputs, params)
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:

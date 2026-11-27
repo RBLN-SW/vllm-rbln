@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.inputs.engine import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
 
@@ -36,7 +37,9 @@ def patch_upstream() -> None:
     topk_topp_sampler.apply_top_k_top_p = topk_topp_sampler.apply_top_k_top_p_pytorch
 
 
-def validate_request(params: "SamplingParams | PoolingParams") -> None:
+def validate_request(
+    processed_inputs: "EngineInput", params: "SamplingParams | PoolingParams"
+) -> None:
     pass
 
 
@@ -49,8 +52,13 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     )
     from vllm_rbln.utils.optimum.registry import (
         get_rbln_model_info,
+        is_encoder_pooling_arch,
         is_multi_modal,
-        is_pooling_arch,
+    )
+
+    assert vllm_config.speculative_config is None, (
+        "Speculative decoding is not supported on the optimum model path. "
+        "Set --model-impl vllm to use it."
     )
 
     # Everything below, and the sync at the end, reads additional_config as an
@@ -109,10 +117,6 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         "Pipeline parallelism is not supported on the optimum model path. "
         "Set --model-impl vllm to use it."
     )
-    assert vllm_config.speculative_config is None, (
-        "Speculative decoding is not supported on the optimum model path. "
-        "Set --model-impl vllm to use it."
-    )
     # T5EncoderModel is encoder-only but inherits T5Config which has
     # is_encoder_decoder=True. This causes vllm to route inputs
     # through the enc-dec path, prepending decoder_start_token_id and
@@ -120,7 +124,9 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     # ModelConfig.is_encoder_decoder is a @cached_property that's
     # already evaluated by this point, so invalidate the cache too.
     hf_config = model_config.hf_config
-    if is_pooling_arch(hf_config) and getattr(hf_config, "is_encoder_decoder", False):
+    if is_encoder_pooling_arch(hf_config) and getattr(
+        hf_config, "is_encoder_decoder", False
+    ):
         hf_config.is_encoder_decoder = False
         with contextlib.suppress(KeyError):
             del model_config.__dict__["is_encoder_decoder"]
@@ -139,6 +145,17 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
 
     disable_unsupported_prefix_caching(vllm_config)
     sync_vllm_and_optimum(vllm_config)
+
+    if (
+        model_config.runner_type == "generate"
+        and getattr(hf_config, "head_dtype", None) is not None
+        and model_config.head_dtype != model_config.dtype
+    ):
+        raise ValueError(
+            "A separate head_dtype is unsupported for generation with "
+            "--model-impl optimum. "
+            "For a separate LM head dtype, use --model-impl vllm."
+        )
 
 
 def _disable_prefix_caching(vllm_config: "VllmConfig", reason: str) -> None:
@@ -173,13 +190,11 @@ def _uses_sliding_window(hf_config) -> bool:
 
 
 def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
-    from vllm_rbln.utils.optimum.predicates import (
-        is_qwen3_embedding,
-        is_qwen3_reranker,
-    )
+    from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
     from vllm_rbln.utils.optimum.registry import (
+        is_decoder_pooling_arch,
         is_enc_dec_arch,
-        is_pooling_arch,
+        is_encoder_pooling_arch,
     )
 
     if not vllm_config.cache_config.enable_prefix_caching:
@@ -195,13 +210,17 @@ def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
     model_config = vllm_config.model_config
     hf_config = model_config.hf_config
 
-    # Prefix caching is supported only for decoder-only models for now.
-    if is_qwen3_embedding(model_config) or is_qwen3_reranker(model_config):
-        _disable_prefix_caching(vllm_config, "Qwen3 pooling models")
+    if is_qwen3_reranker(model_config):
+        _disable_prefix_caching(vllm_config, "Qwen3 reranker models")
     elif is_enc_dec_arch(hf_config):
         _disable_prefix_caching(vllm_config, "encoder-decoder models")
-    elif is_pooling_arch(hf_config):
-        _disable_prefix_caching(vllm_config, "pooling models")
+    elif is_encoder_pooling_arch(hf_config):
+        _disable_prefix_caching(vllm_config, "encoder pooling models")
+    elif (
+        is_decoder_pooling_arch(hf_config)
+        and model_config.pooler_config.seq_pooling_type != "LAST"
+    ):
+        _disable_prefix_caching(vllm_config, "decoder pooling without LAST pooling")
     elif _uses_sliding_window(hf_config):
         _disable_prefix_caching(vllm_config, "sliding window models")
     elif model_config.is_hybrid:

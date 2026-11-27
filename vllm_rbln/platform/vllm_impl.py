@@ -22,10 +22,10 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 
 from vllm_rbln import envs
-from vllm_rbln.platform import use_device_tensor
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.inputs.engine import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
 
@@ -69,15 +69,38 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     _vllm_config = vllm_config
 
 
-def validate_request(params: "SamplingParams | PoolingParams") -> None:
+def validate_request(
+    processed_inputs: "EngineInput", params: "SamplingParams | PoolingParams"
+) -> None:
     from vllm.exceptions import VLLMValidationError
+    from vllm.model_executor.model_loader import get_model_architecture
     from vllm.sampling_params import SamplingParams
 
     from vllm_rbln.v1.core.utils import is_strict_kv_producer
 
+    assert _vllm_config is not None, "validate_request ran before check_and_update"
+    model_config = _vllm_config.model_config
+    # A range longer than the model's longest has no encoder graph or would be
+    # split by a step; either is an engine assert, so refuse the request here.
+    # Image and video ranges only, the ones the scheduler keeps whole.
+    if model_config.is_mm_prefix_lm and processed_inputs.get("mm_placeholders"):
+        model_cls, _ = get_model_architecture(model_config)
+        longest = model_cls.max_mm_prefix_range_len(_vllm_config)
+        for modality in ("image", "video"):
+            for placeholder in processed_inputs["mm_placeholders"].get(modality, []):
+                for first, last in placeholder.extract_embeds_range():
+                    if last + 1 - first > longest:
+                        raise VLLMValidationError(
+                            f"{modality.capitalize()} range of "
+                            f"{last + 1 - first} tokens is above {longest}, the "
+                            "longest the compiled graphs hold. Request a smaller "
+                            "one, or restart with a larger compiled encoder "
+                            "budget.",
+                            parameter="mm_processor_kwargs",
+                            value=last + 1 - first,
+                        )
     if not isinstance(params, SamplingParams):
         return
-    assert _vllm_config is not None, "validate_request ran before check_and_update"
     if not is_strict_kv_producer(_vllm_config):
         return
     if params.max_tokens is None or params.max_tokens > 1:
@@ -131,6 +154,12 @@ def _validate(vllm_config: "VllmConfig") -> None:
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
 
+    if getattr(vllm_config.speculative_config, "enforce_eager", False):
+        raise ValueError(
+            "speculative_config.enforce_eager is not supported "
+            "with the 'vllm' model impl."
+        )
+
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
@@ -153,6 +182,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"{parallel_config.tensor_parallel_size}, pipeline_parallel_size="
                 f"{parallel_config.pipeline_parallel_size}, data_parallel_size="
                 f"{parallel_config.data_parallel_size}."
+            )
+        if model_config.quantization is not None:
+            raise ValueError(
+                "GatedDeltaNet models run unquantized on the RBLN vLLM path for "
+                f"now; got quantization={model_config.quantization}."
             )
         text_config = model_config.hf_text_config
         num_v_heads = text_config.linear_num_value_heads
@@ -462,21 +496,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
         _validate_aux_hidden_states_pp_config(vllm_config)
 
-    # FIXME(jiwoo.park) This is a temporary workaround.
-    if model_config.enforce_eager:
-        if not use_device_tensor():
-            raise ValueError(
-                "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
-                "Eager mode bypasses torch.compile, so ops must dispatch "
-                "to a real device='rbln' rather than the compile-backend "
-                "fake-CPU tensors used by the default vLLM model path."
-            )
-
-        hf_config = model_config.hf_config
-        assert not hasattr(hf_config, "sliding_window") or not getattr(
-            hf_config, "use_sliding_window", True
-        )
-
 
 def _validate_aux_hidden_states_pp_config(vllm_config: "VllmConfig") -> None:
     """Reject a target whose aux hidden states this plugin cannot carry.
@@ -553,10 +572,6 @@ def _override(vllm_config: "VllmConfig") -> None:
 
     logger.info("Using model_config.dtype for RBLN: %s", model_config.dtype)
 
-    if model_config.enforce_eager:
-        # RBLN(NOTE): force dtype into fp16 for eager mode
-        model_config.dtype = torch.float16
-
     if (
         _keeps_recurrent_state(vllm_config)
         and vllm_config.speculative_config is not None
@@ -630,6 +645,18 @@ def _override(vllm_config: "VllmConfig") -> None:
         cache_config.mamba_cache_mode = "none"
         if not cache_config.user_specified_mamba_block_size:
             cache_config.mamba_block_size = model_config.max_model_len
+
+    spec = vllm_config.speculative_config
+    if (
+        model_config.hf_text_config.model_type == "gemma4_text"
+        and spec is not None
+        and spec.use_gemma4_mtp()
+        and not spec.disable_eagle_block_drop
+    ):
+        # The assistant reads the target's KV and writes none, so the EAGLE block
+        # drop protects nothing. TODO(vllm>=0.34.1): delete with vllm#66234.
+        logger.info("Gemma4 MTP: keeping the last block of a prefix hit.")
+        spec.disable_eagle_block_drop = True
 
 
 def _wire(vllm_config: "VllmConfig") -> None:

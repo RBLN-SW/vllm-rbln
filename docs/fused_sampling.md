@@ -33,14 +33,17 @@ Key components:
 | --- | --- | --- |
 | `--rbln-use-fused-sampling` | `False` | Run penalties, logit bias and min_p inside the sampling graph. Requires `use_custom_sampler`. |
 
-Fused sampling is disabled by default. Enable it on the vllm model path with
+Fused sampling is disabled by default. Enable it on either model path with
 `--rbln-use-fused-sampling`, or pass
 `additional_config={"use_fused_sampling": True}` to `LLM(...)`.
 
-Penalties and logit bias keep the existing path when a step runs speculative
-decoding or a thinking budget. Upstream vLLM rejects min_p with speculative
-decoding. A step also keeps the existing path when the sampler returns processed
+Penalties and logit bias keep the existing path when a step runs a thinking
+budget. A step also keeps the existing path when the sampler returns processed
 logprobs, or when the vocab size is not a multiple of 128.
+
+Under [speculative decoding](#speculative-decoding) the penalties run in the
+rejection-sample graph, unless the step returns logprobs. Upstream vLLM rejects
+logit bias and min_p there.
 
 min_p also runs in a graph with this option on. A step with min_p applies the
 penalties in a graph of their own first, since min_p reads the penalized
@@ -181,20 +184,42 @@ out = scatter(logits_view, cidx, v)
   filled when the step's buffer is assembled.
 - A batch of one is laid out as two half-vocab rows.
 
+### Speculative decoding
+
+Each row of a rejection-sampling step is penalized for its own history, as
+upstream does:
+
+```
+ outputs o, drafts d0 d1 d2
+
+ target 0   o
+ target 1   o + d0
+ target 2   o + d0 + d1
+ bonus      o + d0 + d1 + d2
+```
+
+A draft's penalty goes into the step's buffer only, so a rejected draft leaves
+the request's lanes unchanged.
+
+One plan covers the target rows, then the bonus rows. Its buffers are two
+optional inputs of the rejection-sample graph, which adds two graphs per `K`:
+greedy and random.
+
 ### Shapes and compilation
 
 A fused graph is keyed by its kind (greedy, top-k / top-p, or penalties only
 for min_p steps),
 the number of rows, the row vocab size and `K`. Penalty values, bias values,
 temperature, top-k and top-p are tensor data, so changing them never
-recompiles.
+recompiles. An unused top-k or top-p enters as `vocab size` or `1.0`, so every
+filter combination takes the same graph.
 
 `K` comes from a fixed set per row size: 256, 512, 1024 and a cap, the largest
 multiple of 64 within the row's chunk count (1152 for the half rows of a batch of
 one and 2368 for full rows, with a 151936 vocab). Each step uses the smallest
 `K` that fits the live requests, so it drops back once a long request leaves.
-Every graph key has its own code object, and warm-up compiles every `K`, so
-serving never compiles a new graph.
+Every sampler graph key has its own code object, and warm-up compiles every `K`,
+so serving never compiles a new graph.
 
 A request that touches more chunks than the cap takes the existing path for that
 step.

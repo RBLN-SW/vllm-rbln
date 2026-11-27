@@ -133,7 +133,13 @@ def make_request(
     )
 
 
-def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float):
+def get_vllm_config(
+    async_scheduling=False,
+    max_num_seqs=None,
+    dtype=torch.float,
+    vocab_size=None,
+    **rbln_options,
+):
     max_model_len = MAX_MODEL_LEN
     max_num_batched_tokens = max(max_num_seqs, MAX_MODEL_LEN)
     scheduler_config = SchedulerConfig(
@@ -159,6 +165,7 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float
         "optimum_overrides": {
             "prefill_chunk_size": IB_SIZE,
         },
+        **rbln_options,
     }
     structured_outputs_config = StructuredOutputsConfig(
         backend="guidance",
@@ -170,6 +177,8 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float
         additional_config=additional_config,
         structured_outputs_config=structured_outputs_config,
     )
+    if vocab_size is not None:
+        model_config.model_arch_config.vocab_size = vocab_size
     return vllm_config
 
 
@@ -324,8 +333,12 @@ def create_model_runner(
     max_num_seqs: int = MAX_NUM_SEQ,
     dtype: torch.dtype = torch.float,
     decoder_batch_sizes: tuple[int, ...] | None = None,
+    vocab_size: int | None = None,
+    **rbln_options,
 ):
-    vllm_config = get_vllm_config(max_num_seqs=max_num_seqs, dtype=dtype)
+    vllm_config = get_vllm_config(
+        max_num_seqs=max_num_seqs, dtype=dtype, vocab_size=vocab_size, **rbln_options
+    )
     with set_current_vllm_config(vllm_config, check_compile=False):
         temp_file = tempfile.mkstemp()[1]
         init_distributed_environment(

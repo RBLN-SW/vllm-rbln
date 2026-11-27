@@ -42,6 +42,32 @@ pytestmark = pytest.mark.usefixtures("compile_environment")
 
 
 class TestSync:
+    def test_platform_rejects_target_eager(self):
+        from vllm_rbln.platform import RblnPlatform
+
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=True),
+            speculative_config=None,
+            ec_transfer_config=None,
+            is_mm_encoder_only=False,
+        )
+        with pytest.raises(
+            ValueError, match="--enforce-eager is not supported on RBLN"
+        ):
+            RblnPlatform.check_and_update_config(cfg)
+
+    def test_platform_rejects_speculative_decoding_with_draft_eager(self):
+        from vllm_rbln.platform.optimum_impl import check_and_update
+
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            speculative_config=SimpleNamespace(enforce_eager=True),
+        )
+        with pytest.raises(
+            AssertionError, match="Speculative decoding is not supported"
+        ):
+            check_and_update(cfg)
+
     @pytest.mark.parametrize("block_source", ["vllm", "optimum"])
     @pytest.mark.parametrize(
         "architecture", ["LlamaForCausalLM", "Gemma3ForConditionalGeneration"]
@@ -309,8 +335,11 @@ class TestSync:
         cfg = SimpleNamespace(
             model_config=SimpleNamespace(
                 model="Qwen/Qwen3-0.6B",
+                enforce_eager=False,
                 architectures=hf_config.architectures,
                 runner_type=runner,
+                pooler_config=SimpleNamespace(seq_pooling_type="LAST"),
+                is_hybrid=False,
                 hf_config=hf_config,
                 hf_text_config=hf_config,
                 multimodal_config=None,
@@ -330,7 +359,7 @@ class TestSync:
                 block_size=1024,
                 gpu_memory_utilization=0.9,
                 user_specified_block_size=True,
-                enable_prefix_caching=False,
+                enable_prefix_caching=runner == "pooling",
                 num_gpu_blocks_override=None,
                 user_specified_mamba_block_size=False,
                 mamba_block_size=None,
@@ -357,6 +386,12 @@ class TestSync:
             ([expected_arch], expected_cls, expected_chunk_size, expected_phases)
         ]
         assert cfg.additional_config.single_prefill_chunk_size == expected_chunk_size
+        assert cfg.cache_config.enable_prefix_caching is (
+            runner == "pooling" and not reranker
+        )
+        if cfg.cache_config.enable_prefix_caching:
+            assert cfg.cache_config.block_size == expected_chunk_size
+            assert cfg.additional_config.attn_block_size == 1024
 
     @pytest.mark.parametrize(
         ("reranker", "expected_arch", "expected_cls", "expected_phases"),
@@ -388,8 +423,11 @@ class TestSync:
         cfg = SimpleNamespace(
             model_config=SimpleNamespace(
                 model="Qwen/Qwen3-VL-2B",
+                enforce_eager=False,
                 architectures=hf_config.architectures,
                 runner_type="pooling",
+                pooler_config=SimpleNamespace(seq_pooling_type="LAST"),
+                is_hybrid=False,
                 hf_config=hf_config,
                 hf_text_config=hf_config.text_config,
                 multimodal_config=None,
@@ -409,7 +447,7 @@ class TestSync:
                 block_size=1024,
                 gpu_memory_utilization=0.9,
                 user_specified_block_size=True,
-                enable_prefix_caching=False,
+                enable_prefix_caching=True,
                 num_gpu_blocks_override=None,
                 user_specified_mamba_block_size=False,
                 mamba_block_size=None,
@@ -432,6 +470,7 @@ class TestSync:
         monkeypatch.setattr(sync, "compile_cache_name", generate_name)
         check_and_update(cfg)
         assert observed == [([expected_arch], expected_cls, expected_phases)]
+        assert cfg.cache_config.enable_prefix_caching is not reranker
 
     def test_repeated_sync_preserves_the_compile_config(self, vllm_config_factory):
         cfg = vllm_config_factory()
@@ -818,6 +857,83 @@ def test_image_buckets_do_not_mutate_the_compile_config(vllm_config_factory):
         "image_prefill_chunk_size"
     ] == [512, 256]
     assert compile_cache_name(cfg.additional_config.compile_config) == original_key
+
+
+@pytest.mark.parametrize(
+    ("runner", "head_dtype", "compiled_dtype", "rejects"),
+    [
+        pytest.param("generate", "float32", None, True, id="separate-head"),
+        pytest.param("generate", None, None, False, id="default-head"),
+        pytest.param("generate", "model", None, False, id="model-head"),
+        pytest.param("generate", "bfloat16", None, False, id="matching-head"),
+        pytest.param("generate", "float32", "float32", False, id="matching-artifact"),
+        pytest.param("generate", "bfloat16", "float32", True, id="mismatched-artifact"),
+        pytest.param("pooling", "float32", None, False, id="pooling"),
+    ],
+)
+def test_optimum_head_dtype(
+    tmp_path, monkeypatch, runner, head_dtype, compiled_dtype, rejects
+):
+    from vllm.engine.arg_utils import EngineArgs
+
+    model_dir = tmp_path / "model"
+    Qwen3Config(
+        architectures=["Qwen3ForCausalLM"], max_position_embeddings=1024
+    ).save_pretrained(model_dir)
+    additional_config: dict[str, object] = {"prefill_chunk_size": [128]}
+    if compiled_dtype is not None:
+        artifact = tmp_path / "artifact"
+        artifact.mkdir()
+        (artifact / "rbln_config.json").write_text(
+            json.dumps(
+                {
+                    "batch_size": 1,
+                    "max_seq_len": 1024,
+                    "kvcache_block_size": 1024,
+                    "kvcache_num_blocks": 2,
+                    "prefill_chunk_size": 128,
+                    "dtype": compiled_dtype,
+                    "num_devices": 1,
+                }
+            )
+        )
+        monkeypatch.setattr(
+            sync, "load_compiled_rbln_config", load_compiled_rbln_config
+        )
+        monkeypatch.setattr(
+            sync, "resolve_compiled_model_path", resolve_compiled_model_path
+        )
+        additional_config["artifact_path"] = str(artifact)
+    engine_args = EngineArgs(
+        model=str(model_dir),
+        model_impl="optimum",
+        runner=runner,
+        max_model_len=1024,
+        max_num_seqs=1,
+        block_size=1024,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        hf_overrides={"head_dtype": head_dtype} if head_dtype is not None else {},
+        additional_config=additional_config,
+    )
+
+    if rejects:
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"A separate head_dtype is unsupported for generation with "
+                r"--model-impl optimum.*--model-impl vllm"
+            ),
+        ):
+            engine_args.create_engine_config()
+        return
+
+    config = engine_args.create_engine_config()
+    assert config.model_config.dtype == getattr(torch, compiled_dtype or "bfloat16")
+    if runner == "pooling":
+        assert config.model_config.head_dtype == torch.float32
+    else:
+        assert config.model_config.head_dtype == config.model_config.dtype
 
 
 @pytest.mark.parametrize("model_impl", ["optimum", "transformers"])
