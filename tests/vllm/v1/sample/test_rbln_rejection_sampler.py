@@ -613,9 +613,7 @@ def run_synthetic(impl, rates: list[float]) -> torch.Tensor:
     )
 
 
-# The synthetic count decides how far the row runs; `recovered_token_ids` is
-# filled only where the op itself stopped, so the boundary token is always that
-# one and never a zeroed slot.
+# The synthetic count decides how far the row runs; the draft at the stop ends it.
 @pytest.mark.parametrize(
     "rates,expected,rule",
     [
@@ -626,13 +624,13 @@ def run_synthetic(impl, rates: list[float]) -> torch.Tensor:
         ),
         (
             [1.0, 0.0],
-            [[3, 6, PLACEHOLDER_TOKEN_ID]],
-            "stopping past the op's own stop still carries the op's token, 6, "
-            "rather than the zero sitting in position 1's slot",
+            [[3, 5, PLACEHOLDER_TOKEN_ID]],
+            "stopping past the op's own stop ends on position 1's draft, 5, "
+            "not on the 6 the op drew at position 0",
         ),
         (
             [0.0, 1.0],
-            [[6, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+            [[3, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
             "a rejection ends the run, so position 1 cannot accept on its own",
         ),
     ],
@@ -642,20 +640,30 @@ def test_synthetic_rates_decide_the_row(impl, rates, expected, rule):
     assert run_synthetic(impl, rates).tolist() == expected, rule
 
 
-def test_synthetic_rejection_reuses_the_bonus_when_the_op_accepted_everything(impl):
-    """An op that accepted every draft recovered nothing, so the only token it
-    drew is its bonus; a synthetic rejection has to carry that one."""
-    output = run_rejection_sample(
-        impl,
-        draft_token_ids=SYNTHETIC_ARGMAX,
-        target_argmax_token_ids=SYNTHETIC_ARGMAX,
-        bonus_token_ids=[1],
-        metadata=make_sampling_metadata(
-            temperature=None, all_greedy=True, all_random=False
-        ),
-        synthetic_conditional_rates=torch.tensor([1.0, 0.0]),
-    )
-    assert output.tolist() == [[6, 1, PLACEHOLDER_TOKEN_ID]]
+def test_synthetic_row_ends_on_a_token_its_own_position_allows(impl):
+    """A token drawn under one row's mask can be forbidden at another row."""
+    allowed = [{3, 6}, {5, 7}, {1, 2}]
+    logits = torch.full((3, VOCAB_SIZE), float("-inf"))
+    for row, token_ids in enumerate(allowed):
+        logits[row, list(token_ids)] = 0.0
+
+    for _ in range(32):
+        output = impl.rejection_sample(
+            draft_token_ids=torch.tensor([3, 5], dtype=torch.int32),
+            num_draft_tokens=[2],
+            max_spec_len=NUM_SPEC_TOKENS,
+            cu_num_draft_tokens=torch.tensor([2], dtype=torch.int32),
+            draft_probs=None,
+            target_logits=logits[:2].clone(),
+            bonus_token_ids=None,
+            sampling_metadata=make_sampling_metadata(
+                temperature=torch.tensor([1.0]), all_greedy=False, all_random=True
+            ),
+            synthetic_mode=True,
+            synthetic_conditional_rates=torch.tensor([1.0, 0.0]),
+            bonus_logits=logits[2:].clone(),
+        )
+        assert output.tolist() == [[3, 5, PLACEHOLDER_TOKEN_ID]]
 
 
 def test_synthetic_acceptance_is_capped_by_the_drafted_count(impl):
@@ -679,12 +687,22 @@ def test_synthetic_acceptance_is_capped_by_the_drafted_count(impl):
     ]
 
 
-def test_synthetic_acceptance_stops_at_an_out_of_range_draft_id(impl):
-    """An id at or past the vocabulary counts as a rejection, as in the Torch
-    kernels: the row stops there and carries the op's token."""
+@pytest.mark.parametrize(
+    "draft_token_ids,expected",
+    [
+        ([3, VOCAB_SIZE], [[3, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]]),
+        # `rbln::rejection_sample` stops at position 0 as well, so its 6 belongs there.
+        ([VOCAB_SIZE, 5], [[6, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]]),
+    ],
+    ids=["second_draft", "first_draft"],
+)
+def test_synthetic_acceptance_stops_before_an_out_of_range_draft_id(
+    impl, draft_token_ids, expected
+):
+    """The row ends on a token of the position it stops at."""
     output = run_rejection_sample(
         impl,
-        draft_token_ids=[3, VOCAB_SIZE],
+        draft_token_ids=draft_token_ids,
         target_argmax_token_ids=SYNTHETIC_ARGMAX,
         bonus_token_ids=[1],
         metadata=make_sampling_metadata(
@@ -692,4 +710,4 @@ def test_synthetic_acceptance_stops_at_an_out_of_range_draft_id(impl):
         ),
         synthetic_conditional_rates=torch.ones(NUM_SPEC_TOKENS),
     )
-    assert output.tolist() == [[3, 6, PLACEHOLDER_TOKEN_ID]]
+    assert output.tolist() == expected
