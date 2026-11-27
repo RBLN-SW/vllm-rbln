@@ -165,6 +165,7 @@ from vllm_rbln.v1.core.utils import (
     sub_block_size_in_use,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
+from vllm_rbln.v1.sample.ops.fused_penalty import supports_vocab
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -1777,6 +1778,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 None,  # draft_probs
                 logits,
                 sampling_metadata,
+                input_batch=self.input_batch,
             )
 
         return _depad_sampler_output(out, num_reqs)
@@ -4197,6 +4199,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # One graph per top_k/top_p None-pattern (the sampler's WARM_UP_CONFIGS)
         # plus the one fed bonus token ids (logprobs).
         variants.append(({"bonus_token_ids": bonus_token_ids}, dummy_sampling_metadata))
+        # One identity plan per k.
+        state = self.rejection_sampler.penalty_state
+        fused_shape = torch.Size((batch_size * (num_spec + 1), vocab_size))
+        fused_plans = (
+            [
+                state.identity_plan(fused_shape, self.device, k)
+                for k in state.k_buckets(fused_shape)
+            ]
+            if state is not None and supports_vocab(vocab_size)
+            else []
+        )
         for config in WARM_UP_CONFIGS:
             metadata = dataclasses.replace(
                 dummy_sampling_metadata,
@@ -4213,6 +4226,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 ),
             )
             variants.append(({"bonus_logits": bonus_logits}, metadata))
+            if (metadata.top_p, metadata.top_k) == (None, None):
+                # A plan fills unused filters, so these two configs cover it.
+                variants.extend(
+                    ({"bonus_logits": bonus_logits, "penalty": plan}, metadata)
+                    for plan in fused_plans
+                )
 
             if batch_size > 1 and (metadata.top_p, metadata.top_k) != (None, None):
                 # A batch below the bound arrives through `_pad_rows`'s torch.cat,
@@ -4248,6 +4267,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     self.rejection_sampler.synthetic_conditional_rates
                 ),
                 bonus_logits=bonus_kwargs.get("bonus_logits"),
+                penalty=bonus_kwargs.get("penalty"),
             )
 
     def decode_graph_shapes(self) -> list[tuple[int, int, int | None]]:
