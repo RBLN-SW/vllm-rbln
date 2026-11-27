@@ -36,6 +36,7 @@ from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QWEN3_5_ARCHITECTURES,
     QwenGatedDeltaNetAttention,
     RBLNQwenGatedDeltaNetAttention,
 )
@@ -534,7 +535,8 @@ class TestStateSpec:
         )
 
 
-def test_gdn_aux_caches_sort_after_their_state(monkeypatch):
+@pytest.mark.parametrize("architecture", QWEN3_5_ARCHITECTURES)
+def test_gdn_aux_caches_sort_after_their_state(monkeypatch, architecture):
     def init_upstream(layer, _text_config, config, prefix):
         torch.nn.Module.__init__(layer)
         layer.head_k_dim = layer.head_v_dim = HEAD_DIM
@@ -547,7 +549,7 @@ def test_gdn_aux_caches_sort_after_their_state(monkeypatch):
     config = SimpleNamespace(
         compilation_config=CompilationConfig(),
         model_config=SimpleNamespace(
-            architecture="Qwen3_5ForConditionalGeneration",
+            architecture=architecture,
             dtype=torch.bfloat16,
             get_num_kv_heads=lambda _: HEADS_K,
             get_head_size=lambda: HEAD_DIM,
@@ -574,7 +576,6 @@ def test_upstreams_layer_builds_the_rbln_one():
     "architecture",
     [
         "Qwen3NextForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
         # Upstream's own classes: no RBLN class regroups their weights.
         "Qwen3_5ForCausalLM",
         "InternS2MobiusForConditionalGeneration",
@@ -584,5 +585,5 @@ def test_another_architectures_layer_is_refused(architecture):
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(architecture=architecture)
     )
-    with pytest.raises(NotImplementedError, match="dense Qwen3.5"):
+    with pytest.raises(NotImplementedError, match="Qwen3.5 models only"):
         RBLNQwenGatedDeltaNetAttention(None, vllm_config)

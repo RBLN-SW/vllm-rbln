@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3.5 (Qwen3_5ForConditionalGeneration) with images and video on the vllm
-model path.
+"""Qwen3.5 (Qwen3_5ForConditionalGeneration, and its MoE member
+Qwen3_5MoeForConditionalGeneration) with images and video on the vllm model path.
 
 The vision tower runs as its own compiled graph at fixed patch buckets
 (`encoder_token_budgets`): an image is padded to the smallest bucket that holds
@@ -34,9 +34,11 @@ from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5MoeProcessingInfo,
     Qwen3_5ProcessingInfo,
 )
-from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MoeMTP, Qwen3_5MTP
 from vllm.model_executor.models.qwen3_vl import (
     Qwen3VLDummyInputsBuilder,
     Qwen3VLMultiModalProcessor,
@@ -439,3 +441,20 @@ class RBLNQwen3_5MTP(Qwen3_5MTP):
                 f".layers.{idx}.", f".layers.{start + idx}."
             )
             layers[attn.layer_name] = attn
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    RBLNQwen3_5MultiModalProcessor,
+    info=Qwen3_5MoeProcessingInfo,
+    dummy_inputs=Qwen3VLDummyInputsBuilder,
+)
+class RBLNQwen3_5MoeForConditionalGeneration(
+    RBLNQwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration
+):
+    """The MoE member (Qwen3.5-35B-A3B, Qwen3.6-35B-A3B): upstream's MoE model
+    with the RBLN additions of the dense one. The MRO runs the RBLN __init__
+    and weight regrouping over upstream's MoE constructor and loader."""
+
+
+class RBLNQwen3_5MoeMTP(RBLNQwen3_5MTP, Qwen3_5MoeMTP):
+    """Upstream's MoE drafter, numbered past the target's layers as the dense one."""

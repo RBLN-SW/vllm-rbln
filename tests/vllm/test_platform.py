@@ -660,10 +660,7 @@ class TestRejectedConfigs:
 
         return mutate
 
-    @pytest.mark.parametrize(
-        "model_type, name",
-        [("qwen3_next", "Qwen3-Next"), ("qwen3_5_moe_text", "Qwen3.5-MoE")],
-    )
+    @pytest.mark.parametrize("model_type, name", [("qwen3_next", "Qwen3-Next")])
     def test_other_gdn_models_are_refused(self, reconfigure, model_type, name):
         def other_model(config):
             config.model_config.hf_text_config.model_type = model_type
@@ -858,16 +855,32 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="M-RoPE"):
             reconfigure(lambda config: None)
 
-    def test_mrope_is_allowed_for_qwen3_5(self, reconfigure, gdn, monkeypatch):
+    @pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
+    def test_mrope_is_allowed_for_qwen3_5(
+        self, reconfigure, gdn, monkeypatch, model_type
+    ):
         from vllm.config import ModelConfig
 
         monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
 
         def qwen3_5(config):
             gdn(config)
-            config.model_config.hf_text_config.model_type = "qwen3_5_text"
+            config.model_config.hf_text_config.model_type = model_type
 
         reconfigure(qwen3_5)
+
+    @pytest.mark.parametrize(
+        "model_type, uses",
+        [("qwen3_5_text", True), ("qwen3_5_moe_text", True), ("qwen3_next", False)],
+    )
+    def test_dense_and_moe_qwen3_5_build_gated_delta_net(self, model_type, uses):
+        from vllm_rbln.platform.vllm_impl import _uses_gated_delta_net
+
+        text_config = SimpleNamespace(model_type=model_type)
+        model_config = SimpleNamespace(
+            hf_text_config=text_config, hf_config=text_config
+        )
+        assert _uses_gated_delta_net(model_config) is uses
 
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):

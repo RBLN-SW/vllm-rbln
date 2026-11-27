@@ -13,7 +13,11 @@
 # limitations under the License.
 
 import torch
-from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
+from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.model_executor.models.qwen3_next import (
+    Qwen3NextAttention,
+    Qwen3NextSparseMoeBlock,
+)
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import add_registration
@@ -38,6 +42,13 @@ def register_qwen3_5() -> None:
     )
     ModelRegistry.register_model(
         "Qwen3_5MTP", "vllm_rbln.model_executor.models.qwen3_5:RBLNQwen3_5MTP"
+    )
+    ModelRegistry.register_model(
+        "Qwen3_5MoeForConditionalGeneration",
+        "vllm_rbln.model_executor.models.qwen3_5:RBLNQwen3_5MoeForConditionalGeneration",
+    )
+    ModelRegistry.register_model(
+        "Qwen3_5MoeMTP", "vllm_rbln.model_executor.models.qwen3_5:RBLNQwen3_5MoeMTP"
     )
 
 
@@ -67,3 +78,31 @@ def patched_qwen3_next_project_qkv_gate(
     k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(*lead, -1)
     q, k = self.rotary_emb(positions, q, k)
     return q, k, v, gate
+
+
+@register_patch(
+    target="vllm.model_executor.models.qwen3_next.Qwen3NextSparseMoeBlock.forward",
+    reason=(
+        "Upstream unpacks the hidden states as [tokens, hidden] and hands its "
+        "FusedMoE the hidden states as the router input; the RBLN layout is "
+        "[batch, seq, hidden], RBLNMoERunner takes the router as a callable and "
+        "computes the routed experts only, so the shared expert is added here."
+    ),
+)
+def patched_qwen3_next_moe_forward(
+    self: Qwen3NextSparseMoeBlock,
+    hidden_states: torch.Tensor,
+    already_sequence_parallel: bool = False,
+) -> torch.Tensor:
+    assert hidden_states.dim() == 3  # [B, L, H]
+
+    def router(h: torch.Tensor) -> torch.Tensor:
+        return self.gate(h)[0]
+
+    final_hidden_states = self.experts(hidden_states=hidden_states, router=router)
+    if self.shared_expert is not None:
+        # Qwen2MoeMLP applies the shared expert's sigmoid gate itself.
+        final_hidden_states = final_hidden_states + self.shared_expert(hidden_states)
+    if self.tp_size > 1:
+        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+    return final_hidden_states

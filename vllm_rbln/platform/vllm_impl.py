@@ -114,11 +114,15 @@ def validate_request(
         )
 
 
+# Qwen3.5 dense and MoE: the text model types that build GatedDeltaNet layers.
+QWEN3_5_TEXT_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
+
+
 def _uses_gated_delta_net(model_config) -> bool:
     """A GatedDeltaNet model (Qwen3.5) by its HF text model type. GLM-5.3's KDA
     layers share the `linear_attention` layer type and stay out."""
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
-    return getattr(text_config, "model_type", None) == "qwen3_5_text"
+    return getattr(text_config, "model_type", None) in QWEN3_5_TEXT_MODEL_TYPES
 
 
 def _runs_gated_delta_net(vllm_config: "VllmConfig") -> bool:
@@ -239,15 +243,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "GatedDeltaNet projections are interleaved by key head, a layout the "
             "RBLN layer does not read."
         )
-    if getattr(text_config, "model_type", None) == "qwen3_5_moe_text":
-        raise ValueError(
-            "Qwen3.5-MoE is not supported on the RBLN vLLM path yet: it builds "
-            "the RBLN GatedDeltaNet layer, whose weight regrouping and platform "
-            "rules cover the dense Qwen3.5 models only."
-        )
     if (
         model_config.uses_mrope
-        and getattr(text_config, "model_type", None) != "qwen3_5_text"
+        and getattr(text_config, "model_type", None) not in QWEN3_5_TEXT_MODEL_TYPES
     ):
         # The RBLN M-RoPE forward has run on Qwen3.5 only.
         raise ValueError(

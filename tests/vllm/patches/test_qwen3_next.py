@@ -78,3 +78,41 @@ class TestProjectQkvGate:
         q, _, _, g = project(layer, qkv, torch.zeros(1, 1, dtype=torch.long))
         assert torch.all(q == 1.0 * 2.0 + 1.0)  # q_norm then rotary
         assert torch.all(g == 5.0)
+
+
+class TestMoeForward:
+    """The MoE block keeps the RBLN [batch, seq, hidden] layout, routes through
+    the gate as a callable, and adds the shared expert itself."""
+
+    def _block(self, shared: bool):
+        from vllm_rbln.patches.qwen3_next import patched_qwen3_next_moe_forward
+
+        seen = {}
+
+        def experts(hidden_states, router):
+            seen["router_logits"] = router(hidden_states)
+            return hidden_states * 10.0
+
+        block = SimpleNamespace(
+            tp_size=1,
+            gate=lambda h: (h.sum(-1, keepdim=True), None),
+            experts=experts,
+            shared_expert=(lambda h: h + 1.0) if shared else None,
+        )
+        return block, patched_qwen3_next_moe_forward, seen
+
+    @pytest.mark.parametrize("shared", [True, False])
+    def test_layout_router_and_shared_expert(self, shared):
+        block, forward, seen = self._block(shared)
+        hidden = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        out = forward(block, hidden)
+        expected = hidden * 10.0 + ((hidden + 1.0) if shared else 0.0)
+        assert out.shape == (2, 3, 4)
+        assert torch.equal(out, expected)
+        # The router the experts received is the gate's logits, bias dropped.
+        assert torch.equal(seen["router_logits"], hidden.sum(-1, keepdim=True))
+
+    def test_flat_hidden_states_are_refused(self):
+        block, forward, _ = self._block(True)
+        with pytest.raises(AssertionError):
+            forward(block, torch.zeros(6, 4))
