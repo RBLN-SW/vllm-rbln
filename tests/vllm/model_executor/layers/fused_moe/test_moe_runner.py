@@ -19,11 +19,15 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
+import torch.nn.functional as F
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.platforms import current_platform
 
 import vllm_rbln.model_executor.layers.fused_moe.utils as fused_moe_utils
+from vllm_rbln.compilation.compiler import compile as rbln_compile
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import RBLNMoERunner
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
     _apply_grouped_topk_torch as grouped_topk,
@@ -340,3 +344,56 @@ class TestRegistration:
         # The factory path itself: PluggableLayer.__new__ allocates the RBLN class
         # when the base MoERunner is instantiated.
         assert type(MoERunner.__new__(MoERunner)) is RBLNMoERunner
+
+
+class _SingleGroupMoE(torch.nn.Module):
+    def __init__(self, num_experts, hidden, inter, top_k):
+        super().__init__()
+        g = torch.Generator().manual_seed(0)
+        self.top_k = top_k
+        self.register_buffer("gate", torch.randn(num_experts, hidden, generator=g))
+        self.register_buffer("bias", torch.randn(num_experts, generator=g))
+        w13 = torch.randn(num_experts, 2 * inter, hidden, generator=g) * 0.1
+        self.register_buffer("w13", w13.to(torch.bfloat16))
+        w2 = torch.randn(num_experts, hidden, inter, generator=g) * 0.1
+        self.register_buffer("w2", w2.to(torch.bfloat16))
+
+    def forward(self, hidden_states):
+        routing = grouped_topk(
+            F.linear(hidden_states.float(), self.gate * 0.3),
+            top_k=self.top_k,
+            num_expert_group=1,
+            topk_group=1,
+            scoring_func="sigmoid",
+            renormalize=True,
+            e_score_correction_bias=self.bias * 0.3,
+        )
+        inter = self.w2.shape[-1]
+        return torch.ops.rbln_custom_ops.custom_moe(
+            hidden_states,
+            self.w13[:, :inter],
+            self.w13[:, inter:],
+            self.w2,
+            routing.to(hidden_states.dtype),
+            "silu",
+            expert_map=None,
+            swiglu_limit=None,
+        )
+
+
+@pytest.mark.use_device
+def test_single_group_routing_compiles_and_matches_eager():
+    # Trinity's expert count and top-k: at toy sizes the group stage compiles.
+    def build():
+        return _SingleGroupMoE(num_experts=256, hidden=128, inter=64, top_k=4)
+
+    hidden_states = torch.randn(8, 128, generator=torch.Generator().manual_seed(1)).to(
+        torch.bfloat16
+    )
+
+    reference = build()(hidden_states)
+    dev = current_platform.device_type
+    compiled = rbln_compile(build().to(dev), fullgraph=True)
+    torch.testing.assert_close(
+        compiled(hidden_states.to(dev)).cpu(), reference, rtol=3e-2, atol=1e-2
+    )

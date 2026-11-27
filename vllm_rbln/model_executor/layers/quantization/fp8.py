@@ -13,16 +13,21 @@
 # limitations under the License.
 
 import torch
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn.parameter import Parameter
 from vllm import _custom_ops as ops
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoEConfig,
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     modular_kernel,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import (  # noqa: E501
+    CompressedTensorsW8A8Fp8MoEMethod,
+)
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     all_close_1d,
@@ -309,80 +314,144 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # NOTE(RBLN): fp8 MoE implementation uses custom op
         # router_logits is now pre-computed masked_routing_weights
         # (topk + softmax already done in fused_moe_forward_rbln)
-        orig_shape = x.shape  # noqa: F841
-        num_tokens = orig_shape[:-1].numel()  # noqa: F841
-        hidden_states = x.reshape(num_tokens, -1)
-        masked_routing_weights = router_logits
-        intermediate_size = layer.w2_weight.shape[-1]
+        return _block_fp8_moe(
+            layer,
+            x,
+            router_logits,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            int(self.weight_block_size[1]),
+            self.use_w8a8,
+        )
 
-        # w13_weight: merged gate(up) weights, w2_weight: down weights
-        gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
-        up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
-        down_proj_weight = layer.w2_weight
 
-        down_proj_weight_scale = layer.w2_weight_scale_inv
+class RBLNCompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
+    """Block-fp8 compressed-tensors MoE on the RBLN fp8 custom_moe path.
 
-        # w13_weight_scale_inv: [E, 2 * scale_intermediate, scale_hidden]
-        scale_intermediate_size = layer.w13_weight_scale_inv.shape[1] // 2
-        gate_proj_weight_scale = layer.w13_weight_scale_inv[
-            :, :scale_intermediate_size, :
-        ]
-        up_proj_weight_scale = layer.w13_weight_scale_inv[
-            :, scale_intermediate_size:, :
-        ]
+    Upstream's weights and checkpoint names are kept; its fp8 kernel selection,
+    which has no RBLN backend, is skipped. W8A16 or W8A8 follows use_w8a8, as
+    for Fp8MoEMethod.
+    """
 
-        # 0 is upstream's "no clamp"; custom_moe clamps whenever a limit is given.
-        swiglu_limit = layer.swiglu_limit or None
+    def __init__(
+        self,
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs,
+        moe: FusedMoEConfig,
+    ) -> None:
+        FusedMoEMethodBase.__init__(self, moe)
+        assert weight_quant.strategy == QuantizationStrategy.BLOCK
+        assert input_quant.dynamic
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        self.weight_block_size = weight_quant.block_structure
+        self.block_quant = True
+        self.static_input_scales = False
 
-        if self.use_w8a8:
-            # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k)
-            # group along K and hand both the fp8 tensor and the per-(token,
-            # K-block) scale to the W8A8 MoE custom op.
-            fp8_dtype = torch.float8_e4m3fn
-            finfo = torch.finfo(fp8_dtype)
-            in_block_size = int(self.weight_block_size[1])
-            compute_dtype = hidden_states.dtype
-            hs_shape = hidden_states.shape
-            s_g = hidden_states.reshape(-1, in_block_size).to(torch.float32)
-            amax = s_g.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
-            scale = amax / finfo.max
-            hs_q = (
-                (s_g / scale)
-                .clamp(finfo.min, finfo.max)
-                .to(fp8_dtype)
-                .reshape(hs_shape)
-            )
-            hs_scale = scale.reshape(hs_shape[0], hs_shape[1] // in_block_size)
-            final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
-                hs_q,
-                gate_proj_weight,
-                up_proj_weight,
-                down_proj_weight,
-                masked_routing_weights,
-                layer.activation.value,
-                gate_proj_scale=gate_proj_weight_scale,
-                up_proj_scale=up_proj_weight_scale,
-                down_proj_scale=down_proj_weight_scale,
-                group_size=int(self.weight_block_size[1]),
-                hidden_states_scale=hs_scale,
-                out_dtype=compute_dtype,
-                expert_map=layer.expert_map,
-                swiglu_limit=swiglu_limit,
-            )
-        else:
-            final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
-                hidden_states,
-                gate_proj_weight,
-                up_proj_weight,
-                down_proj_weight,
-                masked_routing_weights,
-                layer.activation.value,
-                gate_proj_scale=gate_proj_weight_scale,
-                up_proj_scale=up_proj_weight_scale,
-                down_proj_scale=down_proj_weight_scale,
-                group_size=int(self.weight_block_size[1]),
-                expert_map=layer.expert_map,
-                swiglu_limit=swiglu_limit,
+        from vllm_rbln.config import get_rbln_config
+
+        self.use_w8a8 = get_rbln_config().use_w8a8
+
+    @property
+    def is_monolithic(self) -> bool:
+        # RBLNMoERunner calls apply() directly; no modular kernel to build.
+        return True
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
+        return None
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+            setattr(
+                layer, name, Parameter(getattr(layer, name).data, requires_grad=False)
             )
 
-        return final_hidden_states.reshape(orig_shape)
+    def apply(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        return _block_fp8_moe(
+            layer,
+            x,
+            router_logits,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            int(self.weight_block_size[1]),
+            self.use_w8a8,
+        )
+
+    def apply_monolithic(self, layer, x, router_logits, input_ids=None):
+        raise RuntimeError("RBLNMoERunner calls apply(), not apply_monolithic()")
+
+
+def _block_fp8_moe(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    masked_routing_weights: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    block_k: int,
+    use_w8a8: bool,
+) -> torch.Tensor:
+    """custom_moe over block-fp8 experts; w13 stacks gate then up."""
+    orig_shape = x.shape
+    num_tokens = orig_shape[:-1].numel()
+    hidden_states = x.reshape(num_tokens, -1)
+    intermediate_size = layer.w2_weight.shape[-1]
+
+    gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
+    up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
+    down_proj_weight = layer.w2_weight
+
+    # w13_scale: [E, 2 * scale_intermediate, scale_hidden]
+    scale_intermediate_size = w13_scale.shape[1] // 2
+    gate_proj_weight_scale = w13_scale[:, :scale_intermediate_size, :]
+    up_proj_weight_scale = w13_scale[:, scale_intermediate_size:, :]
+    swiglu_limit = layer.swiglu_limit or None
+
+    if use_w8a8:
+        fp8_dtype = torch.float8_e4m3fn
+        finfo = torch.finfo(fp8_dtype)
+        compute_dtype = hidden_states.dtype
+        hs_shape = hidden_states.shape
+        s_g = hidden_states.reshape(-1, block_k).to(torch.float32)
+        amax = s_g.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+        scale = amax / finfo.max
+        hs_q = (s_g / scale).clamp(finfo.min, finfo.max).to(fp8_dtype).reshape(hs_shape)
+        hs_scale = scale.reshape(hs_shape[0], hs_shape[1] // block_k)
+        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
+            hs_q,
+            gate_proj_weight,
+            up_proj_weight,
+            down_proj_weight,
+            masked_routing_weights,
+            layer.activation.value,
+            gate_proj_scale=gate_proj_weight_scale,
+            up_proj_scale=up_proj_weight_scale,
+            down_proj_scale=w2_scale,
+            group_size=block_k,
+            hidden_states_scale=hs_scale,
+            out_dtype=compute_dtype,
+            expert_map=layer.expert_map,
+            swiglu_limit=swiglu_limit,
+        )
+    else:
+        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
+            hidden_states,
+            gate_proj_weight,
+            up_proj_weight,
+            down_proj_weight,
+            masked_routing_weights,
+            layer.activation.value,
+            gate_proj_scale=gate_proj_weight_scale,
+            up_proj_scale=up_proj_weight_scale,
+            down_proj_scale=w2_scale,
+            group_size=block_k,
+            expert_map=layer.expert_map,
+            swiglu_limit=swiglu_limit,
+        )
+
+    return final_hidden_states.reshape(orig_shape)

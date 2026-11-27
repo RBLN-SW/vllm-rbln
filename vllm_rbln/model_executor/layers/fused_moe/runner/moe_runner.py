@@ -576,6 +576,27 @@ def _apply_grouped_topk_torch(
         e_score_correction_bias is not None or not renormalize
     ):
         router_logits_2d = F.softmax(router_logits_2d, dim=-1)
+
+    if topk_group >= G:
+        scores_t = router_logits_2d.transpose(0, 1)  # [E, T]
+        if e_score_correction_bias is not None:
+            _, selected_experts = torch.topk(
+                scores_t + e_score_correction_bias.unsqueeze(1), k=top_k, dim=0
+            )
+            topk_weights = scores_t.gather(0, selected_experts)
+        else:
+            topk_weights, selected_experts = torch.topk(scores_t, k=top_k, dim=0)
+        if renormalize:
+            if scoring_func == "softmax" and e_score_correction_bias is None:
+                topk_weights = F.softmax(topk_weights, dim=0)
+            else:
+                topk_weights = topk_weights / topk_weights.sum(
+                    dim=0, keepdim=True
+                ).clamp_min(1e-20)
+        result = torch.zeros_like(scores_t)  # [E, T]
+        result.scatter_(0, selected_experts, topk_weights)
+        return result
+
     grouped = router_logits_2d.reshape(T, G, epg)
 
     if e_score_correction_bias is not None:

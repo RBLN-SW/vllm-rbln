@@ -842,6 +842,19 @@ class TestDetermineAvailableMemory:
         )
         assert cap["n_model_bytes"] == 250
 
+    def test_compressed_tensors_4bit_float_packs_two_a_byte(
+        self, make_worker, monkeypatch
+    ):
+        hf = SimpleNamespace(
+            quantization_config={
+                "config_groups": {"g": {"weights": {"num_bits": 4, "type": "float"}}}
+            }
+        )
+        cap = self._capture(
+            make_worker, monkeypatch, quantization="compressed-tensors", hf_config=hf
+        )
+        assert cap["n_model_bytes"] == 250  # 4-bit, packed 2 (NVFP4)
+
     def test_compressed_tensors_mixed_bits_raises(self, make_worker, monkeypatch):
         hf = SimpleNamespace(
             quantization_config={
