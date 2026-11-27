@@ -70,6 +70,7 @@ class RBLNBlockAuxSpec:
     dtype: torch.dtype
     prefix_cacheable: bool = True
     verify_only: bool = False
+    shares_extent: bool = True
     # The axis of block_shape a TP rank's share of its owner's heads cuts, each
     # index before it one run of them; None where every rank holds the same bytes.
     head_axis: int | None = None

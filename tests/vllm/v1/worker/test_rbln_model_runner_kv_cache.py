@@ -401,6 +401,7 @@ class TestBlockAuxKVCaches:
         dtype=torch.bfloat16,
         prefix_cacheable=True,
         verify_only=False,
+        shares_extent=True,
     ):
         spec = RBLNBlockAuxSpec(
             owner,
@@ -408,6 +409,7 @@ class TestBlockAuxKVCaches:
             dtype,
             prefix_cacheable=prefix_cacheable,
             verify_only=verify_only,
+            shares_extent=shares_extent,
         )
         return SimpleNamespace(get_aux_cache_spec=lambda _config: spec)
 
@@ -459,6 +461,22 @@ class TestBlockAuxKVCaches:
             config,
             monkeypatch,
             {"aux.0": self._aux("layer.0"), "aux.1": self._aux("layer.1")},
+        )
+        assert caches["aux.0"] is not caches["aux.1"]
+
+    def test_an_aux_that_does_not_share_keeps_its_own_buffer(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
+        caches, _, _ = self._allocate(
+            runner,
+            config,
+            monkeypatch,
+            {
+                "aux.0": self._aux("layer.0", shares_extent=False),
+                "aux.1": self._aux("layer.1", shares_extent=False),
+            },
         )
         assert caches["aux.0"] is not caches["aux.1"]
 

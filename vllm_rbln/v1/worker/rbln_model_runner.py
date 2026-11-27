@@ -3704,7 +3704,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 continue
             shape = (num_blocks, *spec.block_shape)
             kind = (spec.owner, shape, spec.dtype)
-            key = (extent_of[spec.owner], shape, spec.dtype, ordinals[kind])
+            home = extent_of[spec.owner] if spec.shares_extent else spec.owner
+            key = (home, shape, spec.dtype, ordinals[kind])
             ordinals[kind] += 1
             if (cache := tensors.get(key)) is None:
                 cache = torch.empty(shape, dtype=spec.dtype, device=device)

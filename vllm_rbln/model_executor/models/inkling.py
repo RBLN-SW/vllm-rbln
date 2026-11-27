@@ -146,7 +146,9 @@ class RBLNInklingConvRing(_RBLNInklingCache):
         return None
 
     def get_aux_cache_spec(self, vllm_config: VllmConfig) -> RBLNBlockAuxSpec:
-        return RBLNBlockAuxSpec(self.owner, self.block_shape, torch.bfloat16)
+        return RBLNBlockAuxSpec(
+            self.owner, self.block_shape, torch.bfloat16, shares_extent=False
+        )
 
     def convolve(
         self, xs: list[torch.Tensor], weights: list[torch.Tensor]
