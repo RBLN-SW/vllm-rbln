@@ -53,6 +53,7 @@ from . import (
     multi_connector,
     multiproc_executor,
     nan_logprobs,
+    nemotron_h,
     oot,
     qwen2_moe,
     qwen3_moe,

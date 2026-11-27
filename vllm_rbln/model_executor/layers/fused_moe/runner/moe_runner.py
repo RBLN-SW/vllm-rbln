@@ -198,7 +198,7 @@ class RBLNMoERunner(MoERunner):
             )
             num_expert_group = getattr(self.router, "num_expert_group", None)
             topk_group = getattr(self.router, "topk_group", None)
-            use_grouped_topk = num_expert_group is not None
+            use_grouped_topk = num_expert_group is not None and num_expert_group > 1
 
             if scoring_func == "sigmoid":
                 if use_grouped_topk:
@@ -434,7 +434,7 @@ class RBLNMoERunner(MoERunner):
         e_score_correction_bias = getattr(self.router, "e_score_correction_bias", None)
         num_expert_group = getattr(self.router, "num_expert_group", None)
         topk_group = getattr(self.router, "topk_group", None)
-        use_grouped_topk = num_expert_group is not None
+        use_grouped_topk = num_expert_group is not None and num_expert_group > 1
 
         if scoring_func == "sigmoid":
             if use_grouped_topk:

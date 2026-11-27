@@ -42,6 +42,19 @@ def _register_fp8_block_kernel() -> None:
             block_kernels.insert(0, kernel_cls)
 
 
+def _register_nvfp4_linear_kernel() -> None:
+    from vllm.model_executor.kernels import linear
+    from vllm.platforms import PlatformEnum
+
+    from vllm_rbln.model_executor.kernels.linear.nvfp4.rbln import (
+        RBLNNvFp4LinearKernel,
+    )
+
+    kernels = linear._POSSIBLE_NVFP4_KERNELS.setdefault(PlatformEnum.OOT, [])
+    if RBLNNvFp4LinearKernel not in kernels:
+        kernels.insert(0, RBLNNvFp4LinearKernel)
+
+
 def _register_unpacked_wna16_linear_kernel() -> None:
     from vllm.model_executor.kernels import linear
     from vllm.platforms import PlatformEnum
@@ -74,6 +87,10 @@ def register_rbln_oot_implementations() -> None:
         QwenGatedDeltaNetAttention,
         RBLNQwenGatedDeltaNetAttention,
     )
+    from vllm_rbln.model_executor.layers.mamba.mamba_mixer2 import (
+        MambaMixer2,
+        RBLNMambaMixer2,
+    )
     from vllm_rbln.model_executor.layers.mla import (
         MultiHeadLatentAttentionWrapper,
         RBLNMultiHeadLatentAttentionWrapper,
@@ -101,5 +118,7 @@ def register_rbln_oot_implementations() -> None:
     _register_oot(DeepseekScalingRotaryEmbedding, RBLNDeepseekScalingRotaryEmbedding)
     _register_oot(MRotaryEmbedding, RBLNMRotaryEmbedding)
     _register_oot(QwenGatedDeltaNetAttention, RBLNQwenGatedDeltaNetAttention)
+    _register_oot(MambaMixer2, RBLNMambaMixer2)
     _register_fp8_block_kernel()
+    _register_nvfp4_linear_kernel()
     _register_unpacked_wna16_linear_kernel()

@@ -38,8 +38,15 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         assert isinstance(w2 := layer.w2_weight, torch.Tensor)
         intermediate_size = w2.shape[-1]
 
-        gate_proj_weight = w13[:, :intermediate_size, :]
-        up_proj_weight = w13[:, intermediate_size:, :]
+        hidden_act = layer.activation.value
+        if layer.activation.is_gated:
+            gate_proj_weight = w13[:, :intermediate_size, :]
+            up_proj_weight = w13[:, intermediate_size:, :]
+        else:
+            # A non-gated expert is down(act(up)): w13 holds up alone.
+            gate_proj_weight = None
+            up_proj_weight = w13
+            hidden_act = hidden_act.removesuffix("_no_mul")
         down_proj_weight = w2
 
         orig_shape = x.shape
@@ -53,7 +60,7 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             up_proj_weight,
             down_proj_weight,
             masked_routing_weights,
-            layer.activation.value,
+            hidden_act,
             expert_map=layer.expert_map,
             swiglu_limit=layer.swiglu_limit or None,
         )

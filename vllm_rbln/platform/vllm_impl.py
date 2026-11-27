@@ -130,12 +130,19 @@ def _runs_gated_delta_net(vllm_config: "VllmConfig") -> bool:
     )
 
 
+def _runs_mamba2(vllm_config: "VllmConfig") -> bool:
+    text_config = vllm_config.model_config.hf_text_config
+    return text_config.model_type == "nemotron_h" and not vllm_config.is_mm_encoder_only
+
+
 def _keeps_recurrent_state(vllm_config: "VllmConfig") -> bool:
     """A language model with a recurrent state a request beside its KV cache:
-    GLM-5.3's KDA layers or GatedDeltaNet ones."""
+    GLM-5.3's KDA layers, GatedDeltaNet ones or Mamba-2 ones."""
     text_config = vllm_config.model_config.hf_text_config
-    return text_config.model_type == "glm5_next_text" or _runs_gated_delta_net(
-        vllm_config
+    return (
+        text_config.model_type == "glm5_next_text"
+        or _runs_gated_delta_net(vllm_config)
+        or _runs_mamba2(vllm_config)
     )
 
 
@@ -221,6 +228,61 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"so its {state_bytes} bytes must fit in a full-attention layer's "
                 f"page ({token_bytes} bytes a token): set --block-size to at least "
                 f"{state_bytes / token_bytes:g}; got {cache_config.block_size}."
+            )
+
+    uses_mamba2 = _runs_mamba2(vllm_config)
+    if uses_mamba2:
+        if rbln_config.use_custom_kernel:
+            raise ValueError(
+                "Mamba-2 models do not take --rbln-use-custom-kernel on the RBLN "
+                "vLLM path yet: its attention kernels read the KV cache in another "
+                "layout than the state, which shares that cache's blocks."
+            )
+        if parallel_config.data_parallel_size > 1:
+            raise ValueError(
+                "Nemotron-H runs with data_parallel_size 1 on the RBLN vLLM path for "
+                "now: its latent MoE routes the full hidden state while the experts "
+                "read the latent one, and RBLNMoERunner's DP gather routes what it "
+                f"gathers; got data_parallel_size={parallel_config.data_parallel_size}."
+            )
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "Speculative decoding over the RBLN Mamba-2 layer is not wired yet."
+            )
+        cache_config = vllm_config.cache_config
+        kv_dtype = kv_cache_dtype_str_to_dtype(cache_config.cache_dtype, model_config)
+        if kv_dtype != model_config.dtype:
+            # A bf16 view of an fp8 page reaches the op as fp8: functionalizing
+            # its in-place update rebuilds the view from the base without the
+            # dtype change. The Mamba-2 ops have to take the page as bytes.
+            raise ValueError(
+                "A Mamba-2 state is declared in the activation dtype as a "
+                "full-attention KV block on RBLN, so the KV cache has to keep "
+                f"that dtype; got --kv-cache-dtype {cache_config.cache_dtype} "
+                f"for dtype {model_config.dtype}. Pass --kv-cache-dtype "
+                f"{str(model_config.dtype).removeprefix('torch.')}."
+            )
+        hf_config = model_config.hf_config
+        token_bytes = (
+            2
+            * model_config.get_num_kv_heads(parallel_config)
+            * model_config.get_head_size()
+            * get_dtype_size(kv_dtype)
+        )
+        state_bytes = (
+            hf_config.mamba_num_heads
+            // parallel_config.tensor_parallel_size
+            * hf_config.ssm_state_size
+            * hf_config.mamba_head_dim
+            * get_dtype_size(model_config.dtype)
+        )
+        if cache_config.block_size * token_bytes < state_bytes:
+            raise ValueError(
+                "A Mamba-2 state takes a block of the attention pool on RBLN, so a "
+                f"rank's {state_bytes} bytes of it must fit in a full-attention "
+                f"layer's page ({token_bytes} bytes a token): set --block-size to "
+                f"at least {state_bytes / token_bytes:g}; got "
+                f"{cache_config.block_size}."
             )
 
     if vllm_config.is_mm_encoder_only and (
@@ -334,9 +396,10 @@ def _validate(vllm_config: "VllmConfig") -> None:
         raise ValueError(
             f"prefill_chunk_size={chunks} exceeds {max_num_scheduled_tokens=}."
         )
-    if uses_gdn and any(chunk % 128 for chunk in chunks):
+    if (uses_gdn or uses_mamba2) and any(chunk % 128 for chunk in chunks):
         raise ValueError(
-            "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; got "
+            "The RBLN GatedDeltaNet and Mamba-2 prefill kernels run in 128-token "
+            "chunks; got "
             f"prefill_chunk_size={chunks}. Each has to be a multiple of 128 "
             "(--rbln-prefill-chunk-size, or --max-num-batched-tokens without it)."
         )
