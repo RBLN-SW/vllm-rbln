@@ -46,7 +46,9 @@ def _register_nvfp4_linear_kernel() -> None:
     from vllm.model_executor.kernels import linear
     from vllm.platforms import PlatformEnum
 
-    from vllm_rbln.model_executor.kernels.linear.nvfp4 import RBLNNvFp4LinearKernel
+    from vllm_rbln.model_executor.kernels.linear.nvfp4.rbln import (
+        RBLNNvFp4LinearKernel,
+    )
 
     kernels = linear._POSSIBLE_NVFP4_KERNELS.setdefault(PlatformEnum.OOT, [])
     if RBLNNvFp4LinearKernel not in kernels:
