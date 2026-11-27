@@ -1280,6 +1280,45 @@ class TestBuildDummyAttnMetadata:
 
 
 class TestGemma4Drafting:
+    @pytest.mark.parametrize("num_built, expected", [(6, [4, 5]), (12, [10, 11])])
+    def test_kv_sharing_targets_the_last_built_layer_of_each_type(
+        self, num_built, expected
+    ):
+        from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
+
+        def config(layer_types):
+            cfg = SimpleNamespace(layer_types=layer_types, num_kv_shared_layers=0)
+            cfg.get_text_config = lambda: cfg
+            return cfg
+
+        proposer = object.__new__(gemma4_module.RBLNGemma4Proposer)
+        proposer.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=config((["sliding_attention"] * 5 + ["full_attention"]) * 2)
+            )
+        )
+        proposer.speculative_config = SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                hf_config=config(["sliding_attention", "full_attention"])
+            )
+        )
+        layers = [
+            SimpleNamespace(
+                self_attn=SimpleNamespace(
+                    attn=SimpleNamespace(kv_sharing_target_layer_name=None)
+                )
+            )
+            for _ in range(2)
+        ]
+        proposer.model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+        built = {
+            f"language_model.model.layers.{i}.self_attn.attn" for i in range(num_built)
+        }
+        proposer._setup_gemma4_kv_sharing(built)
+        assert [
+            layer.self_attn.attn.kv_sharing_target_layer_name for layer in layers
+        ] == [f"language_model.model.layers.{i}.self_attn.attn" for i in expected]
+
     def test_loading_prepares_the_assistant_mlp_for_its_patched_forward(
         self, monkeypatch
     ):
