@@ -246,8 +246,8 @@ class RBLNRejectionSampler(RejectionSampler):
             synthetic_mode=self.synthetic_mode,
             synthetic_conditional_rates=self.synthetic_conditional_rates,
             bonus_logits=bonus_logits,
-            reuse_sampling_inputs=self._reuse_sampling_inputs,
             penalty=penalty,
+            reuse_sampling_inputs=self._reuse_sampling_inputs,
         )
 
         logprobs_tensors = None
@@ -285,8 +285,8 @@ class RejectionSamplerImpl:
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
-        reuse_sampling_inputs: bool = False,
         penalty: FusedPenaltyPlan | None = None,
+        reuse_sampling_inputs: bool = False,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -315,8 +315,8 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
-        reuse_sampling_inputs: bool = False,
         penalty: FusedPenaltyPlan | None = None,
+        reuse_sampling_inputs: bool = False,
     ) -> torch.Tensor:
         assert bonus_token_ids is not None and penalty is None
         draft_token_ids = draft_token_ids.to(target_logits.device)
@@ -669,8 +669,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
-        reuse_sampling_inputs: bool = False,
         penalty: FusedPenaltyPlan | None = None,
+        reuse_sampling_inputs: bool = False,
     ) -> torch.Tensor:
         target_logits = self.apply_sampling_constraints(
             target_logits,
