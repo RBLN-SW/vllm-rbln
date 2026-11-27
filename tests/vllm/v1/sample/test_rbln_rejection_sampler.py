@@ -803,7 +803,10 @@ def test_sampling_param_tensors_are_reused_until_invalidated(
     assert seen[-1] == [0.5, 0.5, 3.0, 3.0]
 
 
-def test_sampling_param_tensors_follow_partial_draft_counts(impl, monkeypatch):
+@pytest.mark.parametrize("bonus_from_logits", [False, True])
+def test_sampling_param_tensors_follow_partial_draft_counts(
+    impl, monkeypatch, bonus_from_logits
+):
     builds, seen = _recording(impl, monkeypatch)
     metadata = _random_metadata()
     for step, (counts, ids) in enumerate(
@@ -826,10 +829,11 @@ def test_sampling_param_tensors_follow_partial_draft_counts(impl, monkeypatch):
             [1, 1],
             metadata,
             num_draft_tokens=counts,
+            bonus_from_logits=bonus_from_logits,
             reuse_sampling_param_tensors=True,
         )
 
-    assert len(builds) == 5
+    assert len(builds) == 2
     assert seen == [
         [0.5, 0.5, 2.0, 2.0],
         [0.5, 0.5, 2.0, 1.0],

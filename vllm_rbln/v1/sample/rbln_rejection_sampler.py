@@ -402,11 +402,20 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
 
 
 @dataclass(slots=True, eq=False)
-class _SamplingParamTensors:
+class _GraphSamplingParamTensors:
     top_k: torch.Tensor | None
     top_p: torch.Tensor | None
     draft_temperature: torch.Tensor
     bonus_temperature: torch.Tensor | None
+
+
+@dataclass(slots=True, eq=False)
+class _SamplingParamCache:
+    bonus_in_graph: bool
+    has_penalty: bool
+    request_temperature: torch.Tensor | None
+    graph_inputs: _GraphSamplingParamTensors
+    draft_temperature_needs_refresh: bool = False
 
 
 class _RejectionSamplingInputs:
@@ -449,7 +458,7 @@ class _RejectionSamplingInputs:
         self._bonus_temperature = torch.ones(batch_size, dtype=dtype, device=device)
         self._top_k = torch.zeros(batch_size, dtype=torch.int32, device=device)
         self._top_p = torch.ones(batch_size, dtype=torch.float32, device=device)
-        self._greedy_sampling_param_tensors = _SamplingParamTensors(
+        self._greedy_sampling_param_tensors = _GraphSamplingParamTensors(
             top_k=torch.full(
                 (batch_size,), GREEDY_TOP_K, dtype=torch.int32, device=device
             ),
@@ -461,10 +470,7 @@ class _RejectionSamplingInputs:
             batch_size, dtype=torch.int32, device=device
         )
         self._padded_target_logits: torch.Tensor | None = None
-        self._host_cu_num_draft_tokens: torch.Tensor | None = None
-        self._cached_sampling_param_tensors: (
-            tuple[bool, bool, _SamplingParamTensors] | None
-        ) = None
+        self._sampling_param_cache: _SamplingParamCache | None = None
         self._prev_step_had_full_drafts = False
         self._prev_partial_num_draft_tokens: list[int] | None = None
 
@@ -479,7 +485,7 @@ class _RejectionSamplingInputs:
         )
 
     def invalidate_sampling_param_cache(self) -> None:
-        self._cached_sampling_param_tensors = None
+        self._sampling_param_cache = None
 
     def prepare_draft_token_ids(
         self,
@@ -514,6 +520,25 @@ class _RejectionSamplingInputs:
         padded_logits[: target_logits.shape[0]] = target_logits
         return padded_logits
 
+    def _prepare_draft_temperature(
+        self,
+        temperature: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        num_tokens: int,
+        full_drafts: bool,
+    ) -> None:
+        if full_drafts:
+            # The graph input must be a directly allocated tensor.
+            self._temperature.view(-1, self._max_spec_len).copy_(
+                temperature.unsqueeze(1)
+            )
+        else:
+            # Padded rows divide by 1.0 inside the graph.
+            self._temperature.fill_(1)
+            self._temperature[:num_tokens] = expand_batch_to_tokens(
+                temperature, cu_num_draft_tokens, num_tokens
+            )
+
     def prepare_sampling_param_tensors(
         self,
         metadata: SamplingMetadata,
@@ -523,22 +548,26 @@ class _RejectionSamplingInputs:
         bonus_in_graph: bool,
         has_penalty: bool,
         reuse_sampling_param_tensors: bool,
-    ) -> _SamplingParamTensors:
+    ) -> _GraphSamplingParamTensors:
         if metadata.all_greedy:
             return self._greedy_sampling_param_tensors
 
-        cached = (
-            self._cached_sampling_param_tensors
-            if reuse_sampling_param_tensors
-            else None
-        )
-        if cached is not None:
-            cached_bonus_in_graph, cached_has_penalty, tensors = cached
-            if (
-                cached_bonus_in_graph == bonus_in_graph
-                and cached_has_penalty == has_penalty
-            ):
-                return tensors
+        cached = self._sampling_param_cache if reuse_sampling_param_tensors else None
+        if (
+            cached is not None
+            and cached.bonus_in_graph == bonus_in_graph
+            and cached.has_penalty == has_penalty
+        ):
+            if cached.draft_temperature_needs_refresh:
+                if cached.request_temperature is not None:
+                    self._prepare_draft_temperature(
+                        cached.request_temperature,
+                        cu_num_draft_tokens,
+                        num_tokens,
+                        full_drafts,
+                    )
+                cached.draft_temperature_needs_refresh = False
+            return cached.graph_inputs
 
         self.invalidate_sampling_param_cache()
         batch_size, vocab_size, _, device = self.signature
@@ -552,7 +581,7 @@ class _RejectionSamplingInputs:
             top_k = self._top_k.fill_(vocab_size) if top_k is None else top_k
             top_p = self._top_p.fill_(1.0) if top_p is None else top_p
 
-        # Padding and greedy rows divide by 1.0 inside the graph.
+        # Greedy rows divide by 1.0 inside the graph.
         draft_temperature = self._unit_temperature
         bonus_temperature = None
         temperature = metadata.temperature
@@ -566,30 +595,24 @@ class _RejectionSamplingInputs:
                 )
             if bonus_in_graph:
                 bonus_temperature = self._bonus_temperature.copy_(temperature)
-            if full_drafts:
-                # The graph input must be a directly allocated tensor.
-                draft_temperature.view(batch_size, self._max_spec_len).copy_(
-                    temperature.unsqueeze(1)
-                )
-            else:
-                draft_temperature.fill_(1)
-                draft_temperature[:num_tokens] = expand_batch_to_tokens(
-                    temperature, cu_num_draft_tokens, num_tokens
-                )
+            self._prepare_draft_temperature(
+                temperature, cu_num_draft_tokens, num_tokens, full_drafts
+            )
 
-        sampling_param_tensors = _SamplingParamTensors(
+        graph_inputs = _GraphSamplingParamTensors(
             top_k=top_k,
             top_p=top_p,
             draft_temperature=draft_temperature,
             bonus_temperature=bonus_temperature,
         )
         if reuse_sampling_param_tensors:
-            self._cached_sampling_param_tensors = (
-                bonus_in_graph,
-                has_penalty,
-                sampling_param_tensors,
+            self._sampling_param_cache = _SamplingParamCache(
+                bonus_in_graph=bonus_in_graph,
+                has_penalty=has_penalty,
+                request_temperature=temperature,
+                graph_inputs=graph_inputs,
             )
-        return sampling_param_tensors
+        return graph_inputs
 
     def prepare_draft_counts(
         self,
@@ -603,31 +626,22 @@ class _RejectionSamplingInputs:
             return
 
         # The expanded temperature follows the per-request draft boundaries.
-        self.invalidate_sampling_param_cache()
+        if self._sampling_param_cache is not None:
+            self._sampling_param_cache.draft_temperature_needs_refresh = True
         self._prev_step_had_full_drafts = False
         self._prev_partial_num_draft_tokens = None
         self.cu_num_draft_tokens.copy_(cu_num_draft_tokens)
+        host_num_draft_tokens = self._host_num_draft_tokens
         if full_drafts:
-            self._host_num_draft_tokens.fill_(self._max_spec_len)
+            host_num_draft_tokens.fill_(self._max_spec_len)
         else:
-            # Keep the prefix sum differences on the host for the synthetic draw.
-            host_cu_num_draft_tokens = cu_num_draft_tokens
-            if cu_num_draft_tokens.device.type != "cpu":
-                host_cu_num_draft_tokens = self._host_cu_num_draft_tokens
-                if host_cu_num_draft_tokens is None:
-                    host_cu_num_draft_tokens = torch.empty_like(
-                        self._host_num_draft_tokens
-                    )
-                    self._host_cu_num_draft_tokens = host_cu_num_draft_tokens
-                host_cu_num_draft_tokens.copy_(cu_num_draft_tokens)
-            self._host_num_draft_tokens[:1].copy_(host_cu_num_draft_tokens[:1])
-            torch.sub(
-                host_cu_num_draft_tokens[1:],
-                host_cu_num_draft_tokens[:-1],
-                out=self._host_num_draft_tokens[1:],
+            host_num_draft_tokens = torch.tensor(
+                num_draft_tokens, dtype=torch.int32, device="cpu"
             )
-        if self.num_draft_tokens is not self._host_num_draft_tokens:
-            self.num_draft_tokens.copy_(self._host_num_draft_tokens)
+        if self.num_draft_tokens is not host_num_draft_tokens:
+            self.num_draft_tokens.copy_(host_num_draft_tokens)
+            if self.num_draft_tokens.device.type != "cpu":
+                self._host_num_draft_tokens = host_num_draft_tokens
         self._prev_step_had_full_drafts = full_drafts
         if not full_drafts:
             self._prev_partial_num_draft_tokens = num_draft_tokens.copy()
