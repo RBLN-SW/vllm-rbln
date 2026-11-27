@@ -153,7 +153,7 @@ class RBLNConfig(RBLNConfigBase):
     decode_batch_bucket_step: int = 2
     """Step between decode batch buckets."""
 
-    decode_batch_bucket_limit: int = 1
+    decode_batch_bucket_limit: int = 6
     """Largest decode batch bucket."""
 
     decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
