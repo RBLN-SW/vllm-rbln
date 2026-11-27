@@ -74,7 +74,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY: str = "exponential"
     VLLM_RBLN_DECODE_BATCH_BUCKET_MIN: int = 1
     VLLM_RBLN_DECODE_BATCH_BUCKET_STEP: int = 2
-    VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 1
+    VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 6
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     # --- QUANTIZATION ---
     VLLM_RBLN_USE_W8A8: bool = False
@@ -362,7 +362,7 @@ environment_variables = {
     ),
     # Decode batch bucket limit
     "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT": lambda: int(
-        os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)
+        os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 6)
     ),
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
