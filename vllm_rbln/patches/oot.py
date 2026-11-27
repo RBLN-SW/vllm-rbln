@@ -62,6 +62,9 @@ def _register_unpacked_wna16_linear_kernel() -> None:
 
 @add_registration(reason="Register RBLN OOT implementations.")
 def register_rbln_oot_implementations() -> None:
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    from vllm_rbln.model_executor.kernels.residual import RBLNGemmaRMSNorm
     from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
         MoERunner,
         RBLNMoERunner,
@@ -101,5 +104,6 @@ def register_rbln_oot_implementations() -> None:
     _register_oot(DeepseekScalingRotaryEmbedding, RBLNDeepseekScalingRotaryEmbedding)
     _register_oot(MRotaryEmbedding, RBLNMRotaryEmbedding)
     _register_oot(QwenGatedDeltaNetAttention, RBLNQwenGatedDeltaNetAttention)
+    _register_oot(GemmaRMSNorm, RBLNGemmaRMSNorm)
     _register_fp8_block_kernel()
     _register_unpacked_wna16_linear_kernel()

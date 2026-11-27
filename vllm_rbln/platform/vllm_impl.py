@@ -25,6 +25,7 @@ from vllm_rbln import envs
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.inputs.engine import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
@@ -67,6 +68,20 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     _wire(vllm_config)
     _setup_runtime_env(vllm_config)
     _vllm_config = vllm_config
+
+
+def import_ir_kernels() -> None:
+    import vllm_rbln.model_executor.kernels.residual  # noqa: F401
+
+
+def prioritize_ir_ops(
+    vllm_config: "VllmConfig", priority: "IrOpPriorityConfig"
+) -> None:
+    """Put the residual-cut fused_add_rms_norm first for the models that run it."""
+    from vllm_rbln.model_executor.kernels.residual import cuts_residual
+
+    if cuts_residual(vllm_config):
+        priority.fused_add_rms_norm = ["rbln", *priority.fused_add_rms_norm]
 
 
 def validate_request(

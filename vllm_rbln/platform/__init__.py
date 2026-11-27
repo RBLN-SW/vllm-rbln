@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.config.logging import LoggingConfig
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
@@ -129,6 +130,21 @@ class RblnPlatform(Platform):
     @classmethod
     def import_kernels(cls) -> None:
         pass
+
+    @classmethod
+    def import_ir_kernels(cls) -> None:
+        super().import_ir_kernels()
+        if _MODEL_IMPL == "vllm":
+            _impl().import_ir_kernels()
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: VllmConfig
+    ) -> "IrOpPriorityConfig":
+        priority = super().get_default_ir_op_priority(vllm_config)
+        if _MODEL_IMPL == "vllm":
+            _impl().prioritize_ir_ops(vllm_config, priority)
+        return priority
 
     @classmethod
     def get_attn_backend_cls(
