@@ -137,7 +137,7 @@ class RBLNInklingConvRing(_RBLNInklingCache):
         self.width = kernel_size - 1
         self.block_shape = (
             self.width,
-            2 * num_inputs,
+            num_inputs,
             channels // CONV_LANES,
             CONV_LANES,
         )
@@ -157,11 +157,9 @@ class RBLNInklingConvRing(_RBLNInklingCache):
         the current token."""
         metadata = get_forward_context().attn_metadata[self.owner]
         assert isinstance(metadata, RBLNInklingAttentionMetadata), type(metadata)
-        signed = torch.stack([y for x in xs for y in (x, -x)], dim=2)
-        taps = torch.stack([w for w in weights for _ in range(2)], dim=0)
         out = torch.ops.rbln_custom_ops.kda_conv(
-            signed,
-            taps,
+            torch.stack(xs, dim=2),
+            torch.stack(weights, dim=0),
             resolve_kv_cache(metadata, self.prefix),
             metadata.conv_load_blocks,
             metadata.conv_start_positions,
@@ -169,11 +167,9 @@ class RBLNInklingConvRing(_RBLNInklingCache):
             metadata.has_initial_state,
             self.width,
             store_index=metadata.conv_store_blocks,
+            activation="identity",
         ).float()
-        return [
-            (x.float() + out[:, :, 2 * i] - out[:, :, 2 * i + 1]).to(x.dtype)
-            for i, x in enumerate(xs)
-        ]
+        return [(x.float() + out[:, :, i]).to(x.dtype) for i, x in enumerate(xs)]
 
 
 class RBLNInklingAttention(nn.Module):

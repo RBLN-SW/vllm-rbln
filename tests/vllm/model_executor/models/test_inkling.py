@@ -143,3 +143,45 @@ def test_local_layers_keep_only_their_window(monkeypatch):
     assert type(local) is SlidingWindowSpec
     assert local.sliding_window == 64
     assert type(full) is FullAttentionSpec
+
+
+def test_stream_conv_adds_the_conv_rounded_once(monkeypatch):
+    import torch
+    from vllm.config import set_current_vllm_config
+
+    from tests.vllm.vllm_config import make_vllm_config
+    from vllm_rbln.v1.attention import kv_cache_bindings
+    from vllm_rbln.v1.attention.backends.inkling import RBLNInklingAttentionMetadata
+
+    tokens, channels = 16, 128
+    with set_current_vllm_config(make_vllm_config(block_size=128)):
+        ring = inkling.RBLNInklingConvRing("ring", "owner", 2, channels, 4)
+    metadata = RBLNInklingAttentionMetadata.__new__(RBLNInklingAttentionMetadata)
+    index = torch.tensor([1], dtype=torch.int32)
+    metadata.kv_caches = [torch.zeros(2, *ring.block_shape, dtype=torch.bfloat16)]
+    metadata.kv_cache_positions = {"ring": 0}
+    metadata.kv_cache_view_infos = None
+    metadata.conv_load_blocks = metadata.conv_store_blocks = index
+    metadata.conv_start_positions = torch.tensor([0], dtype=torch.int32)
+    metadata.conv_query_lens = torch.tensor([tokens], dtype=torch.int32)
+    metadata.has_initial_state = torch.tensor([0], dtype=torch.int32)
+    context = SimpleNamespace(attn_metadata={"owner": metadata}, additional_kwargs={})
+    for module in (inkling, kv_cache_bindings):
+        monkeypatch.setattr(module, "get_forward_context", lambda: context)
+
+    generator = torch.Generator().manual_seed(0)
+    xs = [
+        torch.randn(1, tokens, channels, generator=generator).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    taps = [
+        torch.randn(channels, 4, generator=generator).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    # Both streams side by side, from an empty ring: x + causal conv, rounded once.
+    seq = torch.cat([torch.zeros(3, 2 * channels), torch.cat(xs, -1)[0].float()]).T
+    weight = torch.cat(taps).float()[:, None]
+    conv = torch.nn.functional.conv1d(seq[None], weight, groups=2 * channels)
+    conv = conv[0].T.to(torch.bfloat16).float().split(channels, dim=-1)
+    for x, c, got in zip(xs, conv, ring.convolve(xs, taps)):
+        assert torch.equal(got, (x.float() + c).to(x.dtype))
