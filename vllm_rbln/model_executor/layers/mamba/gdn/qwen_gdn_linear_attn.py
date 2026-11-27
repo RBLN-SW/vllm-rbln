@@ -82,6 +82,13 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         return resolve_kv_cache(metadata, self.prefix)
 
 
+# The models whose GatedDeltaNet layers the RBLN class and its weight regrouping cover.
+QWEN3_5_ARCHITECTURES = (
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+)
+
+
 class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     """GatedDeltaNet for RBLN: the delta-rule state is declared as a
     full-attention KV block, the conv ring sits in a block-aux cache, and both
@@ -93,10 +100,10 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # Registered out of tree, so other models that build upstream's layer land
         # here too; only the RBLN Qwen3.5 class regroups the weights for it.
         architecture = vllm_config.model_config.architecture
-        if architecture != "Qwen3_5ForConditionalGeneration":
+        if architecture not in QWEN3_5_ARCHITECTURES:
             raise NotImplementedError(
-                "The RBLN GatedDeltaNet layer covers the dense Qwen3.5 models "
-                f"only; got {architecture}."
+                "The RBLN GatedDeltaNet layer covers the Qwen3.5 models only; "
+                f"got {architecture}."
             )
         super().__init__(config, vllm_config, prefix, **kwargs)
         if self.head_k_dim != self.head_v_dim or self.head_k_dim % STATE_LANES:
