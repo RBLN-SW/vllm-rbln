@@ -140,12 +140,15 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
-        # A full-attention KV block, the flash backend's without the custom
-        # kernel (which the platform refuses for a GDN model).
-        # TODO(RBLN): use the linear value heads instead of self.num_kv_heads.
-        return (
-            (2, self.num_kv_heads, 1, self.cache_config.block_size, self.kv_head_size),
+        # A full-attention KV block (the flash backend's without the custom
+        # kernel) viewed by key head. TODO(RBLN): upstream's (Hv, Dv, Dk)
+        # once the compiler takes the state in its own shape.
+        num_k_heads = self.num_k_heads // self.tp_size
+        rows, rest = divmod(
+            self.num_kv_heads * self.cache_config.block_size, num_k_heads
         )
+        assert rest == 0, "a key head's state fills whole rows of the block"
+        return ((2, num_k_heads, 1, rows, self.kv_head_size),)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # The verify kernel replays accepted drafts from the draft buffer, so

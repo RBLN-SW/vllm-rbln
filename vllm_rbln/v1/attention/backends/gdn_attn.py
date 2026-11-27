@@ -14,10 +14,10 @@
 
 """GatedDeltaNet (Qwen3.5 `linear_attention`) state on RBLN.
 
-A layer's state is a `MambaSpec` block declared as a full-attention KV page, so
-the layers sharing a buffer are one graph input with one chiplet cut. The
-kernels read a state prefix of each local page and preserve the trailing
-padding. A padding row uses null block 0.
+A layer's state is a `MambaSpec` block declared as a full-attention KV page
+viewed by key head, so the layers sharing a buffer are one graph input. The
+kernels read a state prefix of each page and preserve the trailing padding. A
+padding row uses null block 0.
 
 The builder addresses the block a row loads (its last computed token's) and
 the block it stores to (its last scheduled token's) by the group's block table.
