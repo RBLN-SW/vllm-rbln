@@ -1110,6 +1110,9 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
             assert bonus_logits.dtype == head_dtype
             assert bonus_logits.device == device
         metadata = call.args[4]
+        if not metadata.all_greedy:
+            assert metadata.temperature is not None
+            assert metadata.temperature.dtype == torch.float32
         filters = [t for t in (metadata.top_k, metadata.top_p) if t is not None]
         variants.append(
             (
