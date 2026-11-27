@@ -434,11 +434,13 @@ class _RejectionSamplingInputs:
         self.cu_num_draft_tokens = torch.zeros(
             batch_size, dtype=torch.int32, device=device
         )
-        self._host_counts = torch.empty(batch_size, dtype=torch.int32, device="cpu")
-        self.counts = (
-            self._host_counts
+        self._host_num_draft_tokens = torch.empty(
+            batch_size, dtype=torch.int32, device="cpu"
+        )
+        self.num_draft_tokens = (
+            self._host_num_draft_tokens
             if device.type == "cpu"
-            else torch.empty_like(self._host_counts, device=device)
+            else torch.empty_like(self._host_num_draft_tokens, device=device)
         )
         self._temperature = torch.ones(self._padded_len, dtype=dtype, device=device)
         self._unit_temperature = torch.ones(
@@ -596,19 +598,21 @@ class _RejectionSamplingInputs:
             self._prev_step_had_full_drafts = False
             self.cu_num_draft_tokens.copy_(cumulative)
             if full_drafts:
-                self._host_counts.fill_(self._max_spec_len)
+                self._host_num_draft_tokens.fill_(self._max_spec_len)
             else:
                 # Keep the prefix sum differences on the host for the synthetic draw.
                 if cumulative.device.type != "cpu":
                     if (host_cumulative := self._host_cumulative) is None:
                         host_cumulative = self._host_cumulative = torch.empty_like(
-                            self._host_counts
+                            self._host_num_draft_tokens
                         )
                     cumulative = host_cumulative.copy_(cumulative)
-                self._host_counts[:1].copy_(cumulative[:1])
-                torch.sub(cumulative[1:], cumulative[:-1], out=self._host_counts[1:])
-            if self.counts is not self._host_counts:
-                self.counts.copy_(self._host_counts)
+                self._host_num_draft_tokens[:1].copy_(cumulative[:1])
+                torch.sub(
+                    cumulative[1:], cumulative[:-1], out=self._host_num_draft_tokens[1:]
+                )
+            if self.num_draft_tokens is not self._host_num_draft_tokens:
+                self.num_draft_tokens.copy_(self._host_num_draft_tokens)
             self._prev_step_had_full_drafts = full_drafts
 
     def sample_synthetic_acceptance_counts(
@@ -620,7 +624,7 @@ class _RejectionSamplingInputs:
         accepted = torch.rand(batch_size, width) < synthetic_conditional_rates
         drawn = accepted.to(torch.int32).cumprod(dim=1).sum(dim=1)
         return self._synthetic_num_accepted.copy_(
-            torch.minimum(drawn, self._host_counts)
+            torch.minimum(drawn, self._host_num_draft_tokens)
         )
 
 
@@ -743,7 +747,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             sampling_param_tensors.draft_temperature,
             inputs.draft_per_batch,
             bonus_token_ids,
-            inputs.counts,
+            inputs.num_draft_tokens,
             bonus_logits,
             sampling_param_tensors.bonus_temperature,
             synthetic_num_accepted,
