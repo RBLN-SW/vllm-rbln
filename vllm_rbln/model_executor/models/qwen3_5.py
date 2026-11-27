@@ -246,6 +246,13 @@ class RBLNQwen3_5ForConditionalGeneration(
             )
             for weight in (attn.in_proj_qkvz.weight, attn.conv1d.weight):
                 weight.data[: rows.numel()] = weight.data[rows]
+            # Block-quantized: a head is whole rows of scales, which move along.
+            scale = getattr(attn.in_proj_qkvz, "weight_scale_inv", None)
+            if scale is not None:
+                block_rows = attn.in_proj_qkvz.weight_block_size[0]
+                assert attn.head_k_dim % block_rows == 0, (attn.head_k_dim, block_rows)
+                scale_rows = rows[::block_rows] // block_rows
+                scale.data[: scale_rows.numel()] = scale.data[scale_rows]
         return loaded
 
     @classmethod
