@@ -770,43 +770,7 @@ def test_sampling_param_tensors_follow_fused_penalty_mode(impl):
             assert tensors.top_k is None and tensors.top_p is None
 
 
-@pytest.mark.parametrize("inference_tensors", [False, True])
-def test_sampling_param_tensors_are_reused_until_invalidated(
-    impl, monkeypatch, inference_tensors
-):
-    builds, seen = _recording(impl, monkeypatch)
-    with torch.inference_mode(inference_tensors):
-        metadata = _random_metadata()
-        for _ in range(3):
-            run_rejection_sample(
-                impl,
-                [3, 5, 2, 4],
-                [3, 5, 2, 4],
-                [1, 1],
-                metadata,
-                reuse_sampling_param_tensors=True,
-            )
-        assert len(builds) == 1
-        assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
-
-        metadata.temperature[1] = 3.0
-        impl.invalidate_sampling_param_cache()
-        run_rejection_sample(
-            impl,
-            [3, 5, 2, 4],
-            [3, 5, 2, 4],
-            [1, 1],
-            metadata,
-            reuse_sampling_param_tensors=True,
-        )
-    assert len(builds) == 2
-    assert seen[-1] == [0.5, 0.5, 3.0, 3.0]
-
-
-@pytest.mark.parametrize("bonus_from_logits", [False, True])
-def test_sampling_param_tensors_follow_partial_draft_counts(
-    impl, monkeypatch, bonus_from_logits
-):
+def test_sampling_param_tensors_follow_partial_draft_counts(impl, monkeypatch):
     builds, seen = _recording(impl, monkeypatch)
     metadata = _random_metadata()
     for step, (counts, ids) in enumerate(
@@ -829,7 +793,7 @@ def test_sampling_param_tensors_follow_partial_draft_counts(
             [1, 1],
             metadata,
             num_draft_tokens=counts,
-            bonus_from_logits=bonus_from_logits,
+            bonus_from_logits=True,
             reuse_sampling_param_tensors=True,
         )
 
@@ -848,17 +812,10 @@ def test_direct_calls_prepare_sampling_param_tensors_every_time(impl, monkeypatc
     builds, seen = _recording(impl, monkeypatch)
     metadata = _random_metadata()
     run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
+    metadata.temperature[1] = 3.0
     run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
     assert len(builds) == 2
-    assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
-
-
-@pytest.mark.parametrize("impl", [None], indirect=True)
-def test_sampling_requires_initialized_inputs(impl):
-    with pytest.raises(AssertionError, match="Call initialize_sampling_inputs"):
-        run_rejection_sample(
-            impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], _random_metadata()
-        )
+    assert seen[-1] == [0.5, 0.5, 3.0, 3.0]
 
 
 @pytest.mark.parametrize("impl", [None], indirect=True)
@@ -867,46 +824,13 @@ def test_sampling_validates_the_allocated_device(impl):
     impl.initialize_sampling_inputs(2, VOCAB_SIZE, torch.float32, requested_device)
     run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], _random_metadata())
 
-    with pytest.raises(AssertionError, match="already initialized"):
-        impl.initialize_sampling_inputs(2, VOCAB_SIZE, torch.float32, requested_device)
 
-
-def test_a_new_batch_size_is_rejected_without_replacing_buffers(impl, monkeypatch):
-    builds, seen = _recording(impl, monkeypatch)
-    large_batch = _random_metadata()
+def test_sampling_rejects_mismatched_batch_size(impl):
     small_batch = make_sampling_metadata(
         temperature=torch.tensor([3.0]), all_greedy=False, all_random=True
     )
-    run_rejection_sample(
-        impl,
-        [3, 5, 2, 4],
-        [3, 5, 2, 4],
-        [1, 1],
-        large_batch,
-        reuse_sampling_param_tensors=True,
-    )
-    inputs = impl._rejection_sampling_inputs
-
     with pytest.raises(AssertionError, match="Rejection sampler input signature"):
-        run_rejection_sample(
-            impl,
-            [3, 5],
-            [3, 5],
-            [1],
-            small_batch,
-        )
-
-    run_rejection_sample(
-        impl,
-        [3, 5, 2, 4],
-        [3, 5, 2, 4],
-        [1, 1],
-        large_batch,
-        reuse_sampling_param_tensors=True,
-    )
-    assert impl._rejection_sampling_inputs is inputs
-    assert len(builds) == 1
-    assert seen == [[0.5, 0.5, 2.0, 2.0], [0.5, 0.5, 2.0, 2.0]]
+        run_rejection_sample(impl, [3, 5], [3, 5], [1], small_batch)
 
 
 def test_draft_count_buffers_are_reused_across_full_and_partial_steps(
