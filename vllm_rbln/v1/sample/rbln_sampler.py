@@ -393,6 +393,8 @@ class RBLNSampler(VLLMSampler):
             k, p = self._filled_top_k_top_p(k, p, rows, vocab, logits.device)
             out = min_p_sample(logits, temperature, k, p, log_min_p)
         elif penalty is not None:
+            # Keep-everything: one graph for every filter combination.
+            k, p = self._filled_top_k_top_p(k, p, rows, vocab, logits.device)
             out = self._fused_graph("top_k_top_p", penalty)(
                 logits,
                 penalty.cidx,
