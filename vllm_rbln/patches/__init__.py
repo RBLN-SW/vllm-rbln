@@ -40,6 +40,7 @@ from . import (
     gpt_oss,
     gpt_oss_mxfp4_config,
     harmony,
+    kv_cache_ready,
     kv_connector_factory,
     kv_connector_utils,
     metrics,
