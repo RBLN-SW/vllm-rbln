@@ -411,7 +411,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.speculative_config,
                 self.device,
                 use_rbln_sampler=self.rbln_config.use_custom_sampler,
-                reuse_sampling_inputs=self.rbln_config.use_custom_sampler,
+                reuse_sampling_param_tensors=self.rbln_config.use_custom_sampler,
             )
 
         self.num_spec_tokens = 0
@@ -913,7 +913,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             and (rejection_sampler := getattr(self, "rejection_sampler", None))
             is not None
         ):
-            rejection_sampler.invalidate_sampling_inputs()
+            rejection_sampler.invalidate_sampling_param_cache()
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData

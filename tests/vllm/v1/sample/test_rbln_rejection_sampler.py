@@ -360,7 +360,7 @@ def run_rejection_sample(
     num_draft_tokens: list[int] | None = None,
     bonus_from_logits: bool = False,
     synthetic_conditional_rates: torch.Tensor | None = None,
-    reuse_sampling_inputs: bool = False,
+    reuse_sampling_param_tensors: bool = False,
 ) -> torch.Tensor:
     """Run the impl on a batch of drafts packed in `draft_token_ids` order.
 
@@ -386,7 +386,7 @@ def run_rejection_sample(
         synthetic_mode=synthetic_conditional_rates is not None,
         synthetic_conditional_rates=synthetic_conditional_rates,
         bonus_logits=make_target_probs(bonus_token_ids) if bonus_from_logits else None,
-        reuse_sampling_inputs=reuse_sampling_inputs,
+        reuse_sampling_param_tensors=reuse_sampling_param_tensors,
     )
 
 
@@ -746,31 +746,32 @@ def _random_metadata():
     )
 
 
-def test_sampling_inputs_follow_fused_penalty_mode(impl):
+def test_sampling_param_tensors_follow_fused_penalty_mode(impl):
     inputs = impl._rejection_sampling_inputs
     assert inputs is not None
     metadata = make_sampling_metadata(torch.ones(2), all_greedy=False, all_random=True)
     cumulative = torch.tensor([2, 4], dtype=torch.int32)
 
     for has_penalty in (False, True, True, False):
-        args = inputs.prepare_sampling_args(
+        tensors = inputs.prepare_sampling_param_tensors(
             metadata,
             cumulative,
             4,
             full_drafts=True,
             bonus_in_graph=True,
             has_penalty=has_penalty,
-            reuse_sampling_inputs=True,
+            reuse_sampling_param_tensors=True,
         )
         if has_penalty:
-            assert args.top_k is not None and args.top_k.tolist() == [VOCAB_SIZE] * 2
-            assert args.top_p is not None and args.top_p.tolist() == [1.0] * 2
+            assert tensors.top_k is not None
+            assert tensors.top_k.tolist() == [VOCAB_SIZE] * 2
+            assert tensors.top_p is not None and tensors.top_p.tolist() == [1.0] * 2
         else:
-            assert args.top_k is None and args.top_p is None
+            assert tensors.top_k is None and tensors.top_p is None
 
 
 @pytest.mark.parametrize("inference_tensors", [False, True])
-def test_sampling_inputs_are_staged_once_until_invalidated(
+def test_sampling_param_tensors_are_reused_until_invalidated(
     impl, monkeypatch, inference_tensors
 ):
     builds, seen = _recording(impl, monkeypatch)
@@ -783,26 +784,26 @@ def test_sampling_inputs_are_staged_once_until_invalidated(
                 [3, 5, 2, 4],
                 [1, 1],
                 metadata,
-                reuse_sampling_inputs=True,
+                reuse_sampling_param_tensors=True,
             )
         assert len(builds) == 1
         assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
 
         metadata.temperature[1] = 3.0
-        impl.invalidate_sampling_inputs()
+        impl.invalidate_sampling_param_cache()
         run_rejection_sample(
             impl,
             [3, 5, 2, 4],
             [3, 5, 2, 4],
             [1, 1],
             metadata,
-            reuse_sampling_inputs=True,
+            reuse_sampling_param_tensors=True,
         )
     assert len(builds) == 2
     assert seen[-1] == [0.5, 0.5, 3.0, 3.0]
 
 
-def test_a_partial_step_drops_the_staged_inputs(impl, monkeypatch):
+def test_a_partial_step_invalidates_cached_sampling_param_tensors(impl, monkeypatch):
     # A step with fewer drafts writes per-token values into the same buffers,
     # so the next full step stages again instead of reading them.
     builds, seen = _recording(impl, monkeypatch)
@@ -813,7 +814,7 @@ def test_a_partial_step_drops_the_staged_inputs(impl, monkeypatch):
         [3, 5, 2, 4],
         [1, 1],
         metadata,
-        reuse_sampling_inputs=True,
+        reuse_sampling_param_tensors=True,
     )
     run_rejection_sample(
         impl,
@@ -822,7 +823,7 @@ def test_a_partial_step_drops_the_staged_inputs(impl, monkeypatch):
         [1, 1],
         metadata,
         num_draft_tokens=[2, 1],
-        reuse_sampling_inputs=True,
+        reuse_sampling_param_tensors=True,
     )
     run_rejection_sample(
         impl,
@@ -830,13 +831,13 @@ def test_a_partial_step_drops_the_staged_inputs(impl, monkeypatch):
         [3, 5, 2, 4],
         [1, 1],
         metadata,
-        reuse_sampling_inputs=True,
+        reuse_sampling_param_tensors=True,
     )
     assert len(builds) == 3
     assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
 
 
-def test_direct_calls_prepare_sampling_inputs_every_time(impl, monkeypatch):
+def test_direct_calls_prepare_sampling_param_tensors_every_time(impl, monkeypatch):
     builds, seen = _recording(impl, monkeypatch)
     metadata = _random_metadata()
     run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
@@ -875,7 +876,7 @@ def test_a_new_batch_size_is_rejected_without_replacing_buffers(impl, monkeypatc
         [3, 5, 2, 4],
         [1, 1],
         large_batch,
-        reuse_sampling_inputs=True,
+        reuse_sampling_param_tensors=True,
     )
     inputs = impl._rejection_sampling_inputs
 
@@ -894,7 +895,7 @@ def test_a_new_batch_size_is_rejected_without_replacing_buffers(impl, monkeypatc
         [3, 5, 2, 4],
         [1, 1],
         large_batch,
-        reuse_sampling_inputs=True,
+        reuse_sampling_param_tensors=True,
     )
     assert impl._rejection_sampling_inputs is inputs
     assert len(builds) == 1

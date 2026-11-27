@@ -82,13 +82,13 @@ def measure(
         partial_cumulative,
         logits[:-1],
     )
-    impl.invalidate_sampling_inputs()
+    impl.invalidate_sampling_param_cache()
 
     def run(steps: int) -> None:
         for step in range(steps):
             if change_every and (step + 1) % change_every == 0:
                 temperature[0] = 0.7 if (step // change_every) % 2 == 0 else 0.8
-                impl.invalidate_sampling_inputs()
+                impl.invalidate_sampling_param_cache()
             ids, counts, max_drafts, cumulative, target = (
                 partial if partial_every and (step + 1) % partial_every == 0 else full
             )
@@ -102,7 +102,7 @@ def measure(
                 None,
                 metadata,
                 bonus_logits=bonus_logits,
-                reuse_sampling_inputs=True,
+                reuse_sampling_param_tensors=True,
             )
             # Reading the output waits for the runtime to finish sampling.
             output.tolist()

@@ -2000,10 +2000,10 @@ class TestUpdateStates:
         assert "n0" in r.requests
         assert "n0" in r.input_batch.req_id_to_index
 
-    def test_sampling_inputs_are_invalidated_after_batch_changes(self, monkeypatch):
+    def test_sampling_param_cache_is_invalidated_after_batch_changes(self, monkeypatch):
         r = self._runner(monkeypatch, input_batch=_input_batch(0))
         r.rejection_sampler = Mock()
-        invalidate = r.rejection_sampler.invalidate_sampling_inputs
+        invalidate = r.rejection_sampler.invalidate_sampling_param_cache
         scheduled = {"n0": 3, "n1": 3}
         r._update_states(
             _sched(new=[_new_req("n0"), _new_req("n1")], scheduled=scheduled)
