@@ -447,6 +447,25 @@ class TestRejectedConfigs:
         with pytest.raises(ValidationError, match="max_num_batched_tokens <= block"):
             _build(block_size=127, max_num_batched_tokens=128)
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("index_topk", 2048), ("sparse_attention_config", {"freq": [0, 1]})],
+    )
+    def test_sparse_attention_keeps_a_step_within_a_block_on_cr13(
+        self, monkeypatch, reconfigure, field, value
+    ):
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR13"
+        )
+
+        def mutate(config):
+            setattr(config.model_config.hf_text_config, field, value)
+            config.model_config.dtype = torch.bfloat16
+            config.cache_config.block_size = 64
+
+        with pytest.raises(ValueError, match="max_num_batched_tokens <= block"):
+            reconfigure(mutate)
+
     @pytest.mark.parametrize("max_num_batched_tokens", [16, 128, None])
     def test_block_size_must_be_explicit(self, max_num_batched_tokens):
         with pytest.raises(ValidationError, match="requires an explicit block_size"):
