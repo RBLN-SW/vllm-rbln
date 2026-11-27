@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from vllm.config import get_layers_from_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 
@@ -34,9 +35,32 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
     model_returns_tuple = Gemma4Proposer.model_returns_tuple
     _maybe_share_embeddings = Gemma4Proposer._maybe_share_embeddings
     _maybe_share_lm_head = Gemma4Proposer._maybe_share_lm_head
-    _setup_gemma4_kv_sharing = Gemma4Proposer._setup_gemma4_kv_sharing
     validate_same_kv_cache_group = Gemma4Proposer.validate_same_kv_cache_group
     initialize_attn_backend = Gemma4Proposer.initialize_attn_backend
+
+    def _setup_gemma4_kv_sharing(self, target_attn_layer_names: set[str]) -> None:
+        # Upstream picks each draft layer's target from the config's
+        # layer_types, which still list every layer when get_pp_indices builds
+        # only the first N. Retarget to the last built non-KV-shared layer of
+        # the same type; with every layer built this changes nothing.
+        Gemma4Proposer._setup_gemma4_kv_sharing(self, target_attn_layer_names)
+        text_config = self.vllm_config.model_config.hf_config.get_text_config()
+        layer_types = text_config.layer_types
+        num_non_shared = len(layer_types) - getattr(
+            text_config, "num_kv_shared_layers", 0
+        )
+        last_built: dict[str, str] = {}
+        for idx, name in sorted(
+            (extract_layer_index(name), name) for name in target_attn_layer_names
+        ):
+            if idx < num_non_shared:
+                last_built[layer_types[idx]] = name
+        for layer in self.model.model.layers:
+            attn = layer.self_attn.attn
+            target = attn.kv_sharing_target_layer_name
+            if target not in target_attn_layer_names:
+                lt = layer_types[extract_layer_index(target)]
+                attn.kv_sharing_target_layer_name = last_built[lt]
 
     def load_model(self, target_model: nn.Module) -> None:
         target_attn_layer_names = set(
