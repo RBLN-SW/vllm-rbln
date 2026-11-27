@@ -447,6 +447,10 @@ class TestRejectedConfigs:
         with pytest.raises(ValidationError, match="max_num_batched_tokens <= block"):
             _build(block_size=127, max_num_batched_tokens=128)
 
+    def test_a_step_within_a_block_does_not_ask_the_device(self, monkeypatch):
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: None)
+        _build(block_size=128, max_num_batched_tokens=128)
+
     @pytest.mark.parametrize(
         ("where", "field", "value"),
         [

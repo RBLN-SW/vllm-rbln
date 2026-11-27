@@ -321,9 +321,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
     sparse = has_dsa_indexer(model_config) or getattr(
         text_config, "sparse_attention_config", None
     )
-    spans = current_platform.is_cr13() and not sparse
-    lower = "" if spans else "max_num_batched_tokens <= "
-    if (lower and max_num_batched_tokens > block_size) or block_size > max_block_size:
+    crosses = max_num_batched_tokens > block_size
+    if (
+        crosses and (sparse or not current_platform.is_cr13())
+    ) or block_size > max_block_size:
+        lower = "max_num_batched_tokens <= " if crosses else ""
         raise ValueError(
             f"RBLN requires {lower}block_size <= max_block_size, "
             f"got {max_num_batched_tokens=}, {block_size=}, {max_block_size=}. "
