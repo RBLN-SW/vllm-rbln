@@ -21,6 +21,12 @@ import torch
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention import mla_attention as _mla_attention_mod
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsLinearMethod,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    scaled_dequantize,
+)
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
@@ -47,7 +53,7 @@ mla_attention_original_get_and_maybe_dequant_weights = (
         "fp8 falls to the generic base case, which reads the weight back by "
         "running the layer's apply() against an identity matrix -- an eager "
         "matmul the dummy compile device has no NPU to execute. Dequantise "
-        "directly instead."
+        "directly instead, compressed-tensors block fp8 included."
     ),
 )
 def patched_get_and_maybe_dequant_weights(
@@ -58,6 +64,16 @@ def patched_get_and_maybe_dequant_weights(
         weight = layer.weight.detach().to("cpu", torch.float32)
         scale = layer.weight_scale.detach().to("cpu", torch.float32)
         return (weight * scale).to(out_dtype).to(layer.weight.device)
+    block_size = getattr(layer, "weight_block_size", None)
+    if isinstance(quant_method, CompressedTensorsLinearMethod) and block_size:
+        # Block fp8 keeps the weight [out, in] beside an [out/bn, in/bk] scale,
+        # the layout upstream's Fp8LinearMethod branch reads too.
+        weight = layer.weight.detach().to("cpu")
+        scale = layer.weight_scale.detach().to("cpu", torch.float32)
+        dequant = scaled_dequantize(
+            weight, scale, group_shape=block_size, out_dtype=torch.float32
+        )
+        return dequant.to(out_dtype).to(layer.weight.device)
     return mla_attention_original_get_and_maybe_dequant_weights(layer, out_dtype)
 
 

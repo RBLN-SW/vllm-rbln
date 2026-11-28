@@ -28,6 +28,7 @@ from . import (
     attention,
     axk2,
     axk3,
+    compressed_tensors_nvfp4,
     deepseek_mtp,
     deepseek_v2,
     distributed_utils,
