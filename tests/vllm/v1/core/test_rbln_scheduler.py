@@ -209,7 +209,7 @@ class TestSchedulerInit:
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
     def test_sub_block_size_above_token_budget_is_rejected(self):
-        with pytest.raises(ValueError, match="got 512 >= 128 >= 256"):
+        with pytest.raises(ValueError, match="block_size=512, prefill_chunk_size=128"):
             create_rbln_scheduler(
                 enable_prefix_caching=True,
                 block_size=512,

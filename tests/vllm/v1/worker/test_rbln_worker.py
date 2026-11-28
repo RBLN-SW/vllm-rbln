@@ -233,6 +233,7 @@ class TestWorkerFailFast:
             "determine_available_memory",
             "initialize_from_config",
             "compile_or_warm_up_model",
+            "notify_kv_cache_ready",
         ],
     )
     def test_startup_failure_records_exception_before_exit(
@@ -250,6 +251,17 @@ class TestWorkerFailFast:
         elif phase == "initialize_from_config":
             monkeypatch.setattr(wm, "ensure_kv_transfer_initialized", operation)
             args = (SimpleNamespace(num_blocks=1),)
+        elif phase == "notify_kv_cache_ready":
+            monkeypatch.setattr(worker, "synchronize_device", Mock())
+            kv_cache_config = SimpleNamespace(num_blocks=1, kv_cache_tensors=[])
+            worker.connector_kv_cache_config = kv_cache_config
+            worker.model_runner.kv_cache_config = kv_cache_config
+            monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
+            monkeypatch.setattr(
+                wm,
+                "get_kv_transfer_group",
+                lambda: SimpleNamespace(on_kv_cache_ready=operation),
+            )
         else:
             assert phase == "compile_or_warm_up_model"
             monkeypatch.setattr(
@@ -270,7 +282,8 @@ class TestWorkerFailFast:
         monkeypatch.setattr(otel.trace, "get_tracer", provider.get_tracer)
 
         def exit_after_span(code):
-            if phase != "determine_available_memory":
+            # Only the instrumented phases open a span to record the error on.
+            if phase not in ("determine_available_memory", "notify_kv_cache_ready"):
                 (span,) = exporter.get_finished_spans()
                 assert span.attributes["code.filepath"] == wm.__file__
                 assert span.events[0].attributes["exception.message"] == str(error)
@@ -1586,6 +1599,91 @@ class TestKvRegistrationOrder:
         RBLNWorker.apply_dynamic_kv_num_blocks(worker, 64)
 
         assert calls == ["initialize_kv_cache", "register", "resize"]
+
+
+class TestNotifyKvCacheReady:
+    def test_the_connector_hears_after_the_device_drains(self, monkeypatch):
+        # A connector that defers registration here (LMCache's multiprocess
+        # connector) must see the config `register_kv_caches` used to run under.
+        vllm_config = _make_vllm_config()
+        calls: list = []
+        kv_cache_config = SimpleNamespace(num_blocks=8, kv_cache_tensors=[])
+        worker = SimpleNamespace(
+            fail_fast=False,
+            vllm_config=vllm_config,
+            synchronize_device=lambda: calls.append("synchronize"),
+            connector_kv_cache_config=kv_cache_config,
+            model_runner=SimpleNamespace(kv_cache_config=kv_cache_config),
+        )
+        connector = SimpleNamespace(
+            on_kv_cache_ready=lambda: calls.append(get_current_vllm_config())
+        )
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: connector)
+
+        RBLNWorker.notify_kv_cache_ready(worker)
+
+        assert calls == ["synchronize", vllm_config]
+
+    def test_the_connector_sees_the_resized_block_count(self, monkeypatch):
+        # The connector keeps the estimate `initialize_from_config` handed it,
+        # while the dynamic-KV resize reallocates from a copy.
+        page = 4096
+        held: list = []
+        seen: list = []
+        estimate = SimpleNamespace(
+            num_blocks=26,
+            kv_cache_tensors=[
+                SimpleNamespace(size=26 * page, layer_stride=26 * page, offset=0)
+            ],
+        )
+        final = SimpleNamespace(num_blocks=12)
+        model_runner = SimpleNamespace(
+            initialize_kv_cache=lambda cfg: None,
+            register_kv_caches_with_connector=lambda: None,
+        )
+        worker = SimpleNamespace(
+            fail_fast=False,
+            cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
+            vllm_config=_make_vllm_config(),
+            synchronize_device=lambda: None,
+            model_runner=model_runner,
+            dynamic_kv=SimpleNamespace(
+                shrink_for_compile=lambda cfg: cfg,
+                apply_num_blocks=lambda n: setattr(
+                    model_runner, "kv_cache_config", final
+                ),
+                defers_kv_registration=True,
+            ),
+        )
+        connector = SimpleNamespace(
+            on_kv_cache_ready=lambda: seen.append(
+                (held[0].num_blocks, held[0].kv_cache_tensors[0].size)
+            )
+        )
+        monkeypatch.setattr(
+            wm, "ensure_kv_transfer_initialized", lambda vc, cfg: held.append(cfg)
+        )
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: connector)
+        monkeypatch.setattr(wm, "finalize_kv_cache_registrations", lambda g: None)
+
+        RBLNWorker.initialize_from_config(worker, estimate)
+        RBLNWorker.apply_dynamic_kv_num_blocks(worker, 12)
+        RBLNWorker.notify_kv_cache_ready(worker)
+
+        assert seen == [(12, 12 * page)]
+
+    def test_a_worker_without_a_connector_does_nothing(self, monkeypatch):
+        calls: list = []
+        worker = SimpleNamespace(
+            fail_fast=False, synchronize_device=lambda: calls.append("sync")
+        )
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: False)
+
+        RBLNWorker.notify_kv_cache_ready(worker)
+
+        assert calls == []
 
 
 class TestProfile:

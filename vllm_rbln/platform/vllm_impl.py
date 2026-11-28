@@ -317,9 +317,22 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"{max_block_size}."
         )
 
-    if not max_num_batched_tokens <= block_size <= max_block_size:
+    from vllm.platforms import current_platform
+
+    from vllm_rbln.v1.core.utils import has_dsa_indexer
+
+    # REBEL CR13 stores a step longer than a block across blocks, except in its
+    # sparse attention kernels (DeepSeek-V3.2, GLM-5.3, MiniMax-M3).
+    sparse = has_dsa_indexer(model_config) or getattr(
+        text_config, "sparse_attention_config", None
+    )
+    crosses = max_num_batched_tokens > block_size
+    if (
+        crosses and (sparse or not current_platform.is_cr13())
+    ) or block_size > max_block_size:
+        lower = "max_num_batched_tokens <= " if crosses else ""
         raise ValueError(
-            "RBLN requires max_num_batched_tokens <= block_size <= max_block_size, "
+            f"RBLN requires {lower}block_size <= max_block_size, "
             f"got {max_num_batched_tokens=}, {block_size=}, {max_block_size=}. "
             "Set --block-size within this range."
         )

@@ -43,6 +43,7 @@ class TestOverrideBranch:
         return SimpleNamespace(
             cache_config=SimpleNamespace(num_gpu_blocks_override=26, num_gpu_blocks=26),
             additional_config=SimpleNamespace(use_dynamic_kv_cache=dynamic),
+            kv_transfer_config=None,
         )
 
     def test_the_override_skips_the_workers(self, monkeypatch):
@@ -75,6 +76,7 @@ class TestOverrideBranch:
                 num_gpu_blocks_override=None, num_gpu_blocks=26
             ),
             additional_config=SimpleNamespace(use_dynamic_kv_cache=None),
+            kv_transfer_config=None,
         )
         assert dk.patched_initialize_kv_caches(self._engine(calls), config) is (
             kv_cache_config
@@ -97,6 +99,94 @@ class TestOverrideBranch:
         assert out is kv_cache_config
         assert calls == []
         assert caplog.records == []
+
+
+class TestKvCacheReadyNotification:
+    """A KV connector hears the cache is final once, after every resize RPC,
+    whichever branch the resize took."""
+
+    @staticmethod
+    def _run(
+        monkeypatch,
+        *,
+        dynamic=None,
+        unsupported=None,
+        override=None,
+        computed=None,
+        kv_transfer_instance=True,
+    ):
+        calls: list = []
+
+        def collective_rpc(method, args=()):
+            calls.append((method, *args))
+            return [computed]
+
+        kv_cache_config = SimpleNamespace(
+            num_blocks=26, kv_cache_tensors=[], kv_cache_groups=[]
+        )
+        monkeypatch.setattr(
+            dk,
+            "engine_core_original_initialize_kv_caches",
+            lambda self, cfg: kv_cache_config,
+        )
+        monkeypatch.setattr(
+            dk, "dynamic_kv_unsupported_reason", lambda cfg: unsupported
+        )
+        monkeypatch.setattr(dk, "get_kv_cache_capacity", lambda cfg, kv: (0, 1.0))
+        config = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                num_gpu_blocks_override=override, num_gpu_blocks=26
+            ),
+            model_config=SimpleNamespace(max_model_len=4096),
+            additional_config=SimpleNamespace(use_dynamic_kv_cache=dynamic),
+            kv_transfer_config=SimpleNamespace(
+                is_kv_transfer_instance=kv_transfer_instance
+            ),
+        )
+        engine = SimpleNamespace(
+            model_executor=SimpleNamespace(collective_rpc=collective_rpc)
+        )
+        out = dk.patched_initialize_kv_caches(engine, config)
+        assert out is kv_cache_config
+        return calls, out
+
+    @pytest.mark.parametrize(
+        ("branch", "resize_rpcs", "num_blocks"),
+        [
+            ({"dynamic": False}, [], 26),
+            ({"unsupported": "the optimum path"}, [], 26),
+            ({"override": 26}, [], 26),
+            (
+                {},
+                [
+                    ("compute_dynamic_kv_num_blocks",),
+                    ("apply_dynamic_kv_num_blocks", None),
+                ],
+                26,
+            ),
+            (
+                {"computed": 12},
+                [
+                    ("compute_dynamic_kv_num_blocks",),
+                    ("apply_dynamic_kv_num_blocks", 12),
+                ],
+                12,
+            ),
+        ],
+        ids=["off", "unsupported", "override", "resize-fallback", "resized"],
+    )
+    def test_the_connector_hears_after_the_resize(
+        self, monkeypatch, branch, resize_rpcs, num_blocks
+    ):
+        calls, out = self._run(monkeypatch, **branch)
+
+        assert calls == [*resize_rpcs, ("notify_kv_cache_ready",)]
+        assert out.num_blocks == num_blocks
+
+    def test_a_config_without_a_connector_is_not_notified(self, monkeypatch):
+        calls, _ = self._run(monkeypatch, dynamic=False, kv_transfer_instance=False)
+
+        assert calls == []
 
 
 class TestResolveRankNumBlocks:
