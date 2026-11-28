@@ -905,7 +905,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
+        sampling_metadata = self.input_batch.sampling_metadata
         self.input_batch.refresh_metadata()
+        if (
+            self.input_batch.sampling_metadata is not sampling_metadata
+            and (rejection_sampler := getattr(self, "rejection_sampler", None))
+            is not None
+        ):
+            rejection_sampler.invalidate_sampling_param_cache()
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -2653,6 +2660,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             self.logits_processor = self.model.get_language_model().logits_processor
         else:
             self.logits_processor = None
+        if (
+            self.drafter is not None
+            and self.rbln_config.use_custom_sampler
+            and not self.is_strict_kv_producer
+            and not self.is_pooling_model
+            and self.logits_processor is not None
+        ):
+            self.rejection_sampler.initialize_sampling_inputs(
+                self.bucketing_manager.max_batch_size,
+                self.model_config.get_vocab_size(),
+                self.model_config.head_dtype,
+                self.device,
+            )
         # TODO(RBLN): load lora
         if self.drafter is not None:
             logger.info_once("Loading drafter model...")
@@ -4143,14 +4163,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     @torch.inference_mode()
     def _warmup_sampler_decode_batches(self) -> None:
         """Warm the device rejection-sample op at the decode batch size it will see."""
-        if (
-            self.speculative_config is None
-            or self.num_spec_tokens <= 0
-            or self.is_pooling_model
-            or not self.rbln_config.use_custom_sampler
-        ):
-            return
-
         num_spec = self.num_spec_tokens
         vocab_size = self.model_config.get_vocab_size()
         head_dtype = self.model_config.head_dtype
@@ -4254,23 +4266,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 )
         # Random bonus sampling needs the largest workspace. Warm it first for reuse.
         variants.sort(key=lambda variant: variant[1].all_greedy)
-        # Synthetic mode feeds one more input, i.e. a distinct compiled variant.
         for bonus_kwargs, sampling_metadata in variants:
-            self.rejection_sampler.impl.rejection_sample(
+            self.rejection_sampler.warm_up(
                 draft_token_ids,
                 num_draft_tokens,
-                num_spec,
                 cu_num_draft_tokens,
-                None,
                 target_logits,
-                bonus_kwargs.get("bonus_token_ids"),
                 sampling_metadata,
-                synthetic_mode=self.rejection_sampler.synthetic_mode,
-                synthetic_conditional_rates=(
-                    self.rejection_sampler.synthetic_conditional_rates
-                ),
-                bonus_logits=bonus_kwargs.get("bonus_logits"),
-                penalty=bonus_kwargs.get("penalty"),
+                **bonus_kwargs,
             )
 
     def decode_graph_shapes(self) -> list[tuple[int, int, int | None]]:
@@ -4344,11 +4347,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
             if not self.vllm_config.is_mm_encoder_only:
+                is_last_rank = get_pp_group().is_last_rank
+                warm_rejection_sampler = (
+                    is_last_rank
+                    and not self.is_strict_kv_producer
+                    and not self.is_pooling_model
+                    and self.speculative_config is not None
+                    and self.num_spec_tokens > 0
+                    and self.rbln_config.use_custom_sampler
+                )
                 self.run_model_graphs()
 
                 # NOTE(RBLN): the sampler and the rejection sampler are built on
                 # the last PP rank only, so no other rank has anything to warm up here.
-                if get_pp_group().is_last_rank:
+                if is_last_rank:
                     # A strict producer admits one request per step, since every
                     # step it runs is a prefill, so warm-up samples at that width.
                     batch_buckets = (
@@ -4361,9 +4373,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                         for size in batch_buckets:
                             self._dummy_sampler_run(size)
 
-                    # 4-2. rejection sampler -- a producer verifies no drafts.
-                    if not self.is_strict_kv_producer:
-                        self._warmup_sampler_decode_batches()
+                if warm_rejection_sampler:
+                    self._warmup_sampler_decode_batches()
 
                 # 5. specdec (medusa)
                 if isinstance(self.drafter, RBLNMedusaProposer):

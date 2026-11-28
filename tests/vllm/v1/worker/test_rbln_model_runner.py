@@ -920,6 +920,9 @@ def test_a_producer_warms_the_sampler_at_one_request(
         vllm_config=SimpleNamespace(is_mm_encoder_only=False),
         model_config=SimpleNamespace(model="m"),
         is_pooling_model=False,
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
+        num_spec_tokens=2,
+        rbln_config=RBLNConfig(use_custom_sampler=True),
         run_model_graphs=Mock(),
         offload_context=nullcontext,
         bucketing_manager=SimpleNamespace(batch_buckets=[1, 2, 4]),
@@ -978,8 +981,16 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
     """Synthetic mode feeds the graph one more input and dynamo specializes on
     it, so a warm-up forced to `synthetic_mode=False` would compile a variant the
     real steps never ask for -- and the first of them would recompile."""
-    rejection_sample = MagicMock()
+    from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSamplerImpl
+
+    impl = Mock(spec=RBLNRejectionSamplerImpl, num_spec_tokens=2)
     rates = torch.tensor([0.9, 0.8])
+    sampler = mr.RBLNRejectionSampler(
+        Mock(logprobs_mode="raw_logprobs"), use_rbln_sampler=False
+    )
+    sampler.impl = impl
+    sampler.synthetic_mode = True
+    sampler.synthetic_conditional_rates = rates
     runner = _make_runner_stub(
         rbln_config=RBLNConfig(use_custom_sampler=True),
         speculative_config=object(),
@@ -995,72 +1006,108 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
         ),
         max_num_reqs=8,
         input_batch=SimpleNamespace(
-            top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
+            top_p=torch.ones(8),
+            top_k=torch.ones(8, dtype=torch.int32),
         ),
-        rejection_sampler=SimpleNamespace(
-            impl=SimpleNamespace(rejection_sample=rejection_sample),
-            synthetic_mode=True,
-            synthetic_conditional_rates=rates,
-            penalty_state=None,
-        ),
+        rejection_sampler=sampler,
     )
 
     runner._warmup_sampler_decode_batches()
 
-    assert rejection_sample.call_args_list
-    for call in rejection_sample.call_args_list:
+    assert impl.rejection_sample.call_args_list
+    assert [c[0] for c in impl.mock_calls] == [
+        "invalidate_sampling_param_cache",
+        "rejection_sample",
+        "invalidate_sampling_param_cache",
+    ] * impl.rejection_sample.call_count
+    for call in impl.rejection_sample.call_args_list:
         assert call.kwargs["synthetic_mode"] is True
         assert call.kwargs["synthetic_conditional_rates"] is rates
 
 
+def test_load_model_initializes_rejection_buffers_without_warmup(monkeypatch):
+    model = torch.nn.Module()
+    model.logits_processor = object()
+    monkeypatch.setattr(mr.envs, "VLLM_RBLN_ENABLE_WARM_UP", False)
+    loader = Mock()
+    loader.load_model.return_value = model
+    monkeypatch.setattr(mr, "get_model_loader", lambda _: loader)
+    monkeypatch.setattr(mr, "build_process_group_dict", lambda: {})
+    monkeypatch.setattr(mr, "compile", lambda fn, **kw: fn)
+    sampler = Mock(spec=mr.RBLNRejectionSampler)
+    device = torch.device("cpu", 0)
+    runner = _make_runner_stub(
+        load_config=None,
+        vllm_config=None,
+        model_config=SimpleNamespace(
+            model="m", get_vocab_size=lambda: 10, head_dtype=torch.bfloat16
+        ),
+        device=device,
+        offload_context=nullcontext,
+        _resolve_mm_support=lambda: False,
+        drafter=Mock(),
+        is_pooling_model=False,
+        use_aux_hidden_state_outputs=False,
+        _make_weights_contiguous=lambda: None,
+        compile_context=None,
+        runtime_holder=None,
+        rbln_config=RBLNConfig(use_custom_sampler=True),
+        bucketing_manager=SimpleNamespace(max_batch_size=4),
+        rejection_sampler=sampler,
+    )
+
+    runner.load_model()
+
+    sampler.initialize_sampling_inputs.assert_called_once_with(
+        4, 10, torch.bfloat16, device
+    )
+
+
 @pytest.mark.parametrize("head_dtype", [torch.bfloat16, torch.float32])
 def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
-    rejection_sample = MagicMock()
+    sampler = Mock(spec=mr.RBLNRejectionSampler)
+    sampler.penalty_state = None
     runner = _make_runner_stub(
         rbln_config=RBLNConfig(use_custom_sampler=True),
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,
         model_config=SimpleNamespace(get_vocab_size=lambda: 10, head_dtype=head_dtype),
-        device=torch.device("cpu"),
+        device=torch.device("cpu", 0),
         dtype=torch.bfloat16,
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
         max_num_reqs=8,
         input_batch=SimpleNamespace(
-            top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
+            top_p=torch.ones(8),
+            top_k=torch.ones(8, dtype=torch.int32),
         ),
-        rejection_sampler=SimpleNamespace(
-            impl=SimpleNamespace(rejection_sample=rejection_sample),
-            synthetic_mode=False,
-            synthetic_conditional_rates=None,
-            penalty_state=None,
-        ),
+        rejection_sampler=sampler,
     )
 
     runner._warmup_sampler_decode_batches()
 
-    assert rejection_sample.call_args_list[0].args[7].all_random
+    assert sampler.warm_up.call_args_list[0].args[4].all_random
 
     # One call per graph, all at the batch bound; a filtered random pattern
     # twice, once with buffer views and once with torch.cat metadata.
     buffers = {runner.input_batch.top_k.data_ptr(), runner.input_batch.top_p.data_ptr()}
     variants = []
-    for call in rejection_sample.call_args_list:
+    for call in sampler.warm_up.call_args_list:
         assert len(call.args[1]) == 4
-        assert call.args[5].dtype == head_dtype
-        if (bonus_logits := call.kwargs["bonus_logits"]) is not None:
+        assert call.args[3].dtype == head_dtype
+        if (bonus_logits := call.kwargs.get("bonus_logits")) is not None:
             assert bonus_logits.dtype == head_dtype
-        metadata = call.args[7]
+        metadata = call.args[4]
         if not metadata.all_greedy:
             assert metadata.temperature is not None
             assert metadata.temperature.dtype == torch.float32
         filters = [t for t in (metadata.top_k, metadata.top_p) if t is not None]
         variants.append(
             (
-                call.args[6] is None,
-                call.kwargs["bonus_logits"] is None,
+                call.kwargs.get("bonus_token_ids") is None,
+                bonus_logits is None,
                 metadata.all_greedy,
                 metadata.top_k is None,
                 metadata.top_p is None,
@@ -1945,6 +1992,23 @@ class TestUpdateStates:
         r._update_states(_sched(new=[_new_req("n0")], scheduled={"n0": 3}))
         assert "n0" in r.requests
         assert "n0" in r.input_batch.req_id_to_index
+
+    def test_sampling_param_cache_is_invalidated_after_batch_changes(self, monkeypatch):
+        r = self._runner(monkeypatch, input_batch=_input_batch(0))
+        r.rejection_sampler = Mock()
+        invalidate = r.rejection_sampler.invalidate_sampling_param_cache
+        scheduled = {"n0": 3, "n1": 3}
+        r._update_states(
+            _sched(new=[_new_req("n0"), _new_req("n1")], scheduled=scheduled)
+        )
+        invalidate.assert_called_once_with()
+        r._update_states(_sched(scheduled=scheduled))
+        invalidate.assert_called_once_with()
+
+        r._may_reorder_batch = lambda _: r.input_batch.swap_states(0, 1)
+        r._update_states(_sched(scheduled=scheduled))
+        assert r.input_batch.req_ids == ["n1", "n0"]
+        assert invalidate.call_count == 2
 
     def test_new_request_prompt_logprobs_recorded(self, monkeypatch):
         r = self._runner(monkeypatch, input_batch=_input_batch(0))
