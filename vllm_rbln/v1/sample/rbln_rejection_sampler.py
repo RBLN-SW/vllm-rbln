@@ -415,7 +415,7 @@ class _SamplingParamCache:
     has_penalty: bool
     request_temperature: torch.Tensor | None
     graph_inputs: _GraphSamplingParamTensors
-    draft_temperature_needs_refresh: bool = False
+    draft_counts: list[int] | None
 
 
 class _RejectionSamplingInputs:
@@ -471,8 +471,9 @@ class _RejectionSamplingInputs:
         )
         self._padded_target_logits: torch.Tensor | None = None
         self._sampling_param_cache: _SamplingParamCache | None = None
-        self._prev_step_had_full_drafts = False
-        self._prev_partial_num_draft_tokens: list[int] | None = None
+        # Temperature reuse compares snapshots by identity.
+        self._full_draft_counts = [max_spec_len] * batch_size
+        self._draft_counts: list[int] | None = None
 
     def assert_input_signature(
         self, batch_size: int, vocab_size: int, dtype: torch.dtype, device: torch.device
@@ -558,7 +559,7 @@ class _RejectionSamplingInputs:
             and cached.bonus_in_graph == bonus_in_graph
             and cached.has_penalty == has_penalty
         ):
-            if cached.draft_temperature_needs_refresh:
+            if cached.draft_counts is not self._draft_counts:
                 if cached.request_temperature is not None:
                     self._prepare_draft_temperature(
                         cached.request_temperature,
@@ -566,7 +567,7 @@ class _RejectionSamplingInputs:
                         num_tokens,
                         full_drafts,
                     )
-                cached.draft_temperature_needs_refresh = False
+                cached.draft_counts = self._draft_counts
             return cached.graph_inputs
 
         self.invalidate_sampling_param_cache()
@@ -611,6 +612,7 @@ class _RejectionSamplingInputs:
                 has_penalty=has_penalty,
                 request_temperature=temperature,
                 graph_inputs=graph_inputs,
+                draft_counts=self._draft_counts,
             )
         return graph_inputs
 
@@ -620,16 +622,13 @@ class _RejectionSamplingInputs:
         cu_num_draft_tokens: torch.Tensor,
         full_drafts: bool,
     ) -> None:
-        if (full_drafts and self._prev_step_had_full_drafts) or (
-            not full_drafts and num_draft_tokens == self._prev_partial_num_draft_tokens
+        draft_counts = self._full_draft_counts if full_drafts else num_draft_tokens
+        if draft_counts is self._draft_counts or (
+            not full_drafts and draft_counts == self._draft_counts
         ):
             return
 
-        # The expanded temperature follows the per-request draft boundaries.
-        if self._sampling_param_cache is not None:
-            self._sampling_param_cache.draft_temperature_needs_refresh = True
-        self._prev_step_had_full_drafts = False
-        self._prev_partial_num_draft_tokens = None
+        self._draft_counts = None
         self.cu_num_draft_tokens.copy_(cu_num_draft_tokens)
         host_num_draft_tokens = self._host_num_draft_tokens
         if full_drafts:
@@ -642,9 +641,7 @@ class _RejectionSamplingInputs:
             self.num_draft_tokens.copy_(host_num_draft_tokens)
             if self.num_draft_tokens.device.type != "cpu":
                 self._host_num_draft_tokens = host_num_draft_tokens
-        self._prev_step_had_full_drafts = full_drafts
-        if not full_drafts:
-            self._prev_partial_num_draft_tokens = num_draft_tokens.copy()
+        self._draft_counts = draft_counts if full_drafts else draft_counts.copy()
 
     def sample_synthetic_acceptance_counts(
         self, synthetic_conditional_rates: torch.Tensor
