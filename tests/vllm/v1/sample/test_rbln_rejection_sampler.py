@@ -747,13 +747,13 @@ def _random_metadata():
 
 
 def test_sampling_param_tensors_follow_fused_penalty_mode(impl):
-    inputs = impl._rejection_sampling_inputs
-    assert inputs is not None
+    input_buffers = impl._input_buffers
+    assert input_buffers is not None
     metadata = make_sampling_metadata(torch.ones(2), all_greedy=False, all_random=True)
     cumulative = torch.tensor([2, 4], dtype=torch.int32)
 
     for has_penalty in (False, True, True, False):
-        tensors = inputs.prepare_graph_sampling_params(
+        tensors = input_buffers.prepare_graph_sampling_params(
             metadata,
             cumulative,
             4,
