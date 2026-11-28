@@ -144,16 +144,31 @@ class TestDequantizeBlockFp8Weight:
 
 
 class TestApplyBlockScaledMm:
-    def test_w8a16_dequantizes_weight_and_runs_linear(self):
-        # W8A16 uses the activation directly (As is discarded); only the weight is
-        # block-dequantized before the matmul.
+    def test_w8a16_runs_group_quant_linear(self):
+        # W8A16 uses the activation directly (As is discarded) and hands the fp8
+        # weight and its block scales to one group_quant_linear.
         kernel = _w8a16(2, 2)
         activation = torch.ones(1, 4)
-        weight = torch.ones(4, 4)
+        weight = torch.ones(4, 4).to(torch.float8_e4m3fn)
         weight_scale = torch.full((2, 2), 2.0)  # dequant weight -> all 2.0
-        out = kernel.apply_block_scaled_mm(activation, weight, As=None, Bs=weight_scale)
+        with patch.object(
+            kernel, "_dequantize_block_fp8_weight", side_effect=AssertionError
+        ):
+            out = kernel.apply_block_scaled_mm(
+                activation, weight, As=None, Bs=weight_scale
+            )
         # linear(ones[1,4], 2*ones[4,4]) -> each output = 4 * 1 * 2 = 8.
         assert out.flatten().tolist() == pytest.approx([8.0, 8.0, 8.0, 8.0])
+
+    def test_w8a16_ragged_block_dequantizes_weight_and_runs_linear(self):
+        # 3 output rows in blocks of 2: the last block is ragged, so the weight
+        # is dequantized and a plain linear runs instead.
+        kernel = _w8a16(2, 2)
+        activation = torch.ones(1, 4)
+        weight = torch.ones(3, 4)
+        weight_scale = torch.full((2, 2), 2.0)
+        out = kernel.apply_block_scaled_mm(activation, weight, As=None, Bs=weight_scale)
+        assert out.flatten().tolist() == pytest.approx([8.0, 8.0, 8.0])
 
 
 class TestApplyWeights:
