@@ -753,7 +753,7 @@ def test_sampling_param_tensors_follow_fused_penalty_mode(impl):
     cumulative = torch.tensor([2, 4], dtype=torch.int32)
 
     for has_penalty in (False, True, True, False):
-        tensors = inputs.prepare_sampling_param_tensors(
+        tensors = inputs.prepare_graph_sampling_params(
             metadata,
             cumulative,
             4,
@@ -763,11 +763,13 @@ def test_sampling_param_tensors_follow_fused_penalty_mode(impl):
             reuse_sampling_param_tensors=True,
         )
         if has_penalty:
-            assert tensors.top_k is not None
-            assert tensors.top_k.tolist() == [VOCAB_SIZE] * 2
-            assert tensors.top_p is not None and tensors.top_p.tolist() == [1.0] * 2
+            assert tensors.top_k_per_request is not None
+            assert tensors.top_k_per_request.tolist() == [VOCAB_SIZE] * 2
+            assert tensors.top_p_per_request is not None
+            assert tensors.top_p_per_request.tolist() == [1.0] * 2
         else:
-            assert tensors.top_k is None and tensors.top_p is None
+            assert tensors.top_k_per_request is None
+            assert tensors.top_p_per_request is None
 
 
 def test_sampling_param_tensors_follow_partial_draft_counts(impl, monkeypatch):
