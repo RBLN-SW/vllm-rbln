@@ -402,7 +402,7 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
 
 
 @dataclass(slots=True, eq=False)
-class _GraphSamplingParamTensors:
+class _SamplingParamTensors:
     top_k_per_request: torch.Tensor | None
     top_p_per_request: torch.Tensor | None
     expanded_temperature_per_draft: torch.Tensor
@@ -416,7 +416,7 @@ class _CachedSamplingParams:
     samples_bonus_in_graph: bool
     uses_fused_penalty: bool
     temperature_per_request: torch.Tensor | None
-    graph_sampling_params: _GraphSamplingParamTensors
+    graph_sampling_params: _SamplingParamTensors
     # The counts used to expand the cached temperature per draft.
     draft_counts_per_request: list[int] | None
 
@@ -469,7 +469,7 @@ class _RejectionSamplingInputBuffers:
         self._bonus_temperature = torch.ones(batch_size, dtype=dtype, device=device)
         self._top_k = torch.zeros(batch_size, dtype=torch.int32, device=device)
         self._top_p = torch.ones(batch_size, dtype=torch.float32, device=device)
-        self._greedy_sampling_param_tensors = _GraphSamplingParamTensors(
+        self._greedy_sampling_param_tensors = _SamplingParamTensors(
             top_k_per_request=torch.full(
                 (batch_size,), GREEDY_TOP_K, dtype=torch.int32, device=device
             ),
@@ -560,7 +560,7 @@ class _RejectionSamplingInputBuffers:
         bonus_in_graph: bool,
         has_penalty: bool,
         reuse_sampling_param_tensors: bool,
-    ) -> _GraphSamplingParamTensors:
+    ) -> _SamplingParamTensors:
         if metadata.all_greedy:
             return self._greedy_sampling_param_tensors
 
@@ -614,7 +614,7 @@ class _RejectionSamplingInputBuffers:
                 temperature, cu_num_draft_tokens, num_tokens, full_drafts
             )
 
-        graph_inputs = _GraphSamplingParamTensors(
+        graph_inputs = _SamplingParamTensors(
             top_k_per_request=top_k,
             top_p_per_request=top_p,
             expanded_temperature_per_draft=draft_temperature,
