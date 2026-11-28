@@ -61,11 +61,8 @@ class RBLNRejectionSampler(RejectionSampler):
         device: torch.device | None = None,
         *,
         use_rbln_sampler: bool,
-        reuse_sampling_param_tensors: bool = False,
     ):
         super().__init__(sampler, spec_config, device)
-        # The runner invalidates cached parameters when its batch metadata changes.
-        self._reuse_sampling_param_tensors = reuse_sampling_param_tensors
 
         # NOTE(RBLN): Config-fixed spec length. The compiled rejection-sample op
         # is dynamic=False, so padding its inputs to the per-step actual
@@ -112,24 +109,28 @@ class RBLNRejectionSampler(RejectionSampler):
     ) -> None:
         """Compile one rejection graph variant using the prepared buffers."""
         if isinstance(impl := self.impl, RBLNRejectionSamplerImpl):
-            # Synthetic mode compiles a graph with an extra input.
-            impl.rejection_sample(
-                draft_token_ids,
-                num_draft_tokens,
-                impl.num_spec_tokens,
-                cu_num_draft_tokens,
-                None,
-                target_logits,
-                bonus_token_ids,
-                sampling_metadata,
-                synthetic_mode=self.synthetic_mode,
-                synthetic_conditional_rates=self.synthetic_conditional_rates,
-                bonus_logits=bonus_logits,
-                penalty=penalty,
-            )
+            # Warm-up variants change sampling parameters outside batch updates.
+            impl.invalidate_sampling_param_cache()
+            try:
+                impl.rejection_sample(
+                    draft_token_ids,
+                    num_draft_tokens,
+                    impl.num_spec_tokens,
+                    cu_num_draft_tokens,
+                    None,
+                    target_logits,
+                    bonus_token_ids,
+                    sampling_metadata,
+                    synthetic_mode=self.synthetic_mode,
+                    synthetic_conditional_rates=self.synthetic_conditional_rates,
+                    bonus_logits=bonus_logits,
+                    penalty=penalty,
+                )
+            finally:
+                impl.invalidate_sampling_param_cache()
 
     def invalidate_sampling_param_cache(self) -> None:
-        """Drop the cached parameter tensors for the current batch."""
+        """Drop cached tensors when the batch or its sampling parameters change."""
         if isinstance(self.impl, RBLNRejectionSamplerImpl):
             self.impl.invalidate_sampling_param_cache()
 
@@ -248,7 +249,6 @@ class RBLNRejectionSampler(RejectionSampler):
             synthetic_conditional_rates=self.synthetic_conditional_rates,
             bonus_logits=bonus_logits,
             penalty=penalty,
-            reuse_sampling_param_tensors=self._reuse_sampling_param_tensors,
         )
 
         logprobs_tensors = None
@@ -287,7 +287,6 @@ class RejectionSamplerImpl:
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
         penalty: FusedPenaltyPlan | None = None,
-        reuse_sampling_param_tensors: bool = False,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -317,7 +316,6 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
         penalty: FusedPenaltyPlan | None = None,
-        reuse_sampling_param_tensors: bool = False,
     ) -> torch.Tensor:
         assert bonus_token_ids is not None and penalty is None
         draft_token_ids = draft_token_ids.to(target_logits.device)
@@ -416,7 +414,7 @@ class _CachedSamplingParams:
     samples_bonus_in_graph: bool
     uses_fused_penalty: bool
     temperature_per_request: torch.Tensor | None
-    graph_sampling_params: _SamplingParamTensors
+    sampling_param_tensors: _SamplingParamTensors
     # The counts used to expand the cached temperature per draft.
     draft_counts_per_request: list[int] | None
 
@@ -551,7 +549,7 @@ class _RejectionSamplingInputBuffers:
                 temperature_per_request, cu_num_draft_tokens, num_tokens
             )
 
-    def prepare_graph_sampling_params(
+    def prepare_sampling_param_tensors(
         self,
         metadata: SamplingMetadata,
         cu_num_draft_tokens: torch.Tensor,
@@ -559,18 +557,13 @@ class _RejectionSamplingInputBuffers:
         full_drafts: bool,
         bonus_in_graph: bool,
         has_penalty: bool,
-        reuse_sampling_param_tensors: bool,
     ) -> _SamplingParamTensors:
         if metadata.all_greedy:
             return self._greedy_sampling_param_tensors
 
         cached_params = self._sampling_param_cache
-        if (
-            reuse_sampling_param_tensors
-            and cached_params is not None
-            and cached_params.matches_bonus_and_penalty_modes(
-                samples_bonus_in_graph=bonus_in_graph, uses_fused_penalty=has_penalty
-            )
+        if cached_params is not None and cached_params.matches_bonus_and_penalty_modes(
+            samples_bonus_in_graph=bonus_in_graph, uses_fused_penalty=has_penalty
         ):
             # Only the expanded temperature depends on the current draft counts.
             if cached_params.draft_counts_per_request is not self._draft_counts:
@@ -582,7 +575,7 @@ class _RejectionSamplingInputBuffers:
                         full_drafts,
                     )
                 cached_params.draft_counts_per_request = self._draft_counts
-            return cached_params.graph_sampling_params
+            return cached_params.sampling_param_tensors
 
         self.invalidate_sampling_param_cache()
         batch_size, vocab_size, _, device = self.signature
@@ -614,21 +607,20 @@ class _RejectionSamplingInputBuffers:
                 temperature, cu_num_draft_tokens, num_tokens, full_drafts
             )
 
-        graph_inputs = _SamplingParamTensors(
+        sampling_param_tensors = _SamplingParamTensors(
             top_k_per_request=top_k,
             top_p_per_request=top_p,
             expanded_temperature_per_draft=draft_temperature,
             bonus_temperature_per_request=bonus_temperature,
         )
-        if reuse_sampling_param_tensors:
-            self._sampling_param_cache = _CachedSamplingParams(
-                samples_bonus_in_graph=bonus_in_graph,
-                uses_fused_penalty=has_penalty,
-                temperature_per_request=temperature,
-                graph_sampling_params=graph_inputs,
-                draft_counts_per_request=self._draft_counts,
-            )
-        return graph_inputs
+        self._sampling_param_cache = _CachedSamplingParams(
+            samples_bonus_in_graph=bonus_in_graph,
+            uses_fused_penalty=has_penalty,
+            temperature_per_request=temperature,
+            sampling_param_tensors=sampling_param_tensors,
+            draft_counts_per_request=self._draft_counts,
+        )
+        return sampling_param_tensors
 
     def stage_draft_counts(
         self,
@@ -714,8 +706,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
         penalty: FusedPenaltyPlan | None = None,
-        reuse_sampling_param_tensors: bool = False,
     ) -> torch.Tensor:
+        """Sample drafts, reusing parameters until the caller invalidates them."""
         target_logits = self.apply_sampling_constraints(
             target_logits,
             cu_num_draft_tokens,
@@ -764,22 +756,21 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         input_buffers.stage_draft_token_ids(
             draft_token_ids, num_draft_tokens, full_drafts
         )
+        input_buffers.stage_draft_counts(
+            num_draft_tokens, cu_num_draft_tokens, full_drafts
+        )
         graph_target_logits = (
             target_logits
             if full_drafts
             else input_buffers.stage_padded_target_logits(target_logits)
         )
-        input_buffers.stage_draft_counts(
-            num_draft_tokens, cu_num_draft_tokens, full_drafts
-        )
-        graph_sampling_params = input_buffers.prepare_graph_sampling_params(
+        sampling_param_tensors = input_buffers.prepare_sampling_param_tensors(
             sampling_metadata,
             cu_num_draft_tokens,
             num_tokens,
             full_drafts,
             bonus_logits is not None,
             penalty is not None,
-            reuse_sampling_param_tensors,
         )
         synthetic_num_accepted = None
         if synthetic_mode:
@@ -792,14 +783,14 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             input_buffers.draft_token_ids,
             graph_target_logits,
             input_buffers.cu_num_draft_tokens,
-            graph_sampling_params.top_k_per_request,
-            graph_sampling_params.top_p_per_request,
-            graph_sampling_params.expanded_temperature_per_draft,
+            sampling_param_tensors.top_k_per_request,
+            sampling_param_tensors.top_p_per_request,
+            sampling_param_tensors.expanded_temperature_per_draft,
             input_buffers.draft_per_batch,
             bonus_token_ids,
             input_buffers.num_draft_tokens,
             bonus_logits,
-            graph_sampling_params.bonus_temperature_per_request,
+            sampling_param_tensors.bonus_temperature_per_request,
             synthetic_num_accepted,
             *((penalty.cidx, penalty.lanes) if penalty is not None else ()),
         )

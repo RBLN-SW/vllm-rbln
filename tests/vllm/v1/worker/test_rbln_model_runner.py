@@ -1015,6 +1015,11 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
     runner._warmup_sampler_decode_batches()
 
     assert impl.rejection_sample.call_args_list
+    assert [c[0] for c in impl.mock_calls] == [
+        "invalidate_sampling_param_cache",
+        "rejection_sample",
+        "invalidate_sampling_param_cache",
+    ] * impl.rejection_sample.call_count
     for call in impl.rejection_sample.call_args_list:
         assert call.kwargs["synthetic_mode"] is True
         assert call.kwargs["synthetic_conditional_rates"] is rates

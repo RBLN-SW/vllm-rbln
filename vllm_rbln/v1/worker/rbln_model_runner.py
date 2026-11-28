@@ -411,7 +411,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.speculative_config,
                 self.device,
                 use_rbln_sampler=self.rbln_config.use_custom_sampler,
-                reuse_sampling_param_tensors=self.rbln_config.use_custom_sampler,
             )
 
         self.num_spec_tokens = 0

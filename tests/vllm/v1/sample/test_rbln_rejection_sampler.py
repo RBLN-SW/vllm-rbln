@@ -360,7 +360,6 @@ def run_rejection_sample(
     num_draft_tokens: list[int] | None = None,
     bonus_from_logits: bool = False,
     synthetic_conditional_rates: torch.Tensor | None = None,
-    reuse_sampling_param_tensors: bool = False,
 ) -> torch.Tensor:
     """Run the impl on a batch of drafts packed in `draft_token_ids` order.
 
@@ -386,7 +385,6 @@ def run_rejection_sample(
         synthetic_mode=synthetic_conditional_rates is not None,
         synthetic_conditional_rates=synthetic_conditional_rates,
         bonus_logits=make_target_probs(bonus_token_ids) if bonus_from_logits else None,
-        reuse_sampling_param_tensors=reuse_sampling_param_tensors,
     )
 
 
@@ -753,14 +751,13 @@ def test_sampling_param_tensors_follow_fused_penalty_mode(impl):
     cumulative = torch.tensor([2, 4], dtype=torch.int32)
 
     for has_penalty in (False, True, True, False):
-        tensors = input_buffers.prepare_graph_sampling_params(
+        tensors = input_buffers.prepare_sampling_param_tensors(
             metadata,
             cumulative,
             4,
             full_drafts=True,
             bonus_in_graph=True,
             has_penalty=has_penalty,
-            reuse_sampling_param_tensors=True,
         )
         if has_penalty:
             assert tensors.top_k_per_request is not None
@@ -796,7 +793,6 @@ def test_sampling_param_tensors_follow_partial_draft_counts(impl, monkeypatch):
             metadata,
             num_draft_tokens=counts,
             bonus_from_logits=True,
-            reuse_sampling_param_tensors=True,
         )
 
     assert len(builds) == 2
@@ -810,14 +806,20 @@ def test_sampling_param_tensors_follow_partial_draft_counts(impl, monkeypatch):
     ]
 
 
-def test_direct_calls_prepare_sampling_param_tensors_every_time(impl, monkeypatch):
+def test_direct_calls_reuse_sampling_params_until_invalidated(impl, monkeypatch):
     builds, seen = _recording(impl, monkeypatch)
     metadata = _random_metadata()
     run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
+    run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
     metadata.temperature[1] = 3.0
+    impl.invalidate_sampling_param_cache()
     run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
     assert len(builds) == 2
-    assert seen[-1] == [0.5, 0.5, 3.0, 3.0]
+    assert seen == [
+        [0.5, 0.5, 2.0, 2.0],
+        [0.5, 0.5, 2.0, 2.0],
+        [0.5, 0.5, 3.0, 3.0],
+    ]
 
 
 @pytest.mark.parametrize("impl", [None], indirect=True)
