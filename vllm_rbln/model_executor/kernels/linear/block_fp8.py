@@ -81,12 +81,12 @@ class RBLNW8A16BlockFp8LinearKernel(Fp8BlockScaledMMLinearKernel):
     ) -> torch.Tensor:
         del As
 
-        weight = self._dequantize_block_fp8_weight(
-            weight=B,
-            weight_scale=Bs,
-            dtype=A.dtype,
-        )
-        return torch.nn.functional.linear(A, weight)
+        block_n, block_k = [int(v) for v in self.weight_group_shape]
+        # One group_quant_linear over the fp8 weight and its block scales: the
+        # compiler runs it as one dense that dequantizes the weight itself.
+        # The scale goes per output row, which also covers a ragged last block.
+        weight_scale = Bs.repeat_interleave(block_n, dim=0)[: B.shape[0]]
+        return torch.ops.rbln_custom_ops.group_quant_linear(A, B, weight_scale, block_k)
 
     def _dequantize_block_fp8_weight(
         self,
